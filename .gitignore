@@ -1,0 +1,16 @@
+# Build dependencies and generated outputs
+.deps/
+build/
+obs_portable/
+dist/
+backups/
+.codex-remote-attachments/
+aqtinstall.log
+
+# Local compiler and IDE artifacts
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.lnk
