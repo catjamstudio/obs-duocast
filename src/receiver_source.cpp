@@ -10,6 +10,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/frame.h>
 #include <libavutil/error.h>
+#include <libavutil/hwcontext.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
@@ -83,6 +84,7 @@ const char *video_codec_label(AVCodecID id)
 {
 	switch (id) {
 	case AV_CODEC_ID_H264: return "H.264";
+	case AV_CODEC_ID_HEVC: return "HEVC";
 	case AV_CODEC_ID_MJPEG: return "MJPEG";
 	default: return "unknown";
 	}
@@ -172,6 +174,8 @@ private:
 	struct Decoder {
 		AVCodecContext *ctx = nullptr;
 		AVFrame *frame = nullptr;
+		AVFrame *transfer_frame = nullptr;
+		AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
 		SwrContext *resampler = nullptr;
 		tjhandle jpeg = nullptr;
 		std::array<std::vector<std::uint8_t>, 3> jpeg_planes;
@@ -504,6 +508,7 @@ private:
 	{
 		if (d.resampler) swr_free(&d.resampler);
 		if (d.frame) av_frame_free(&d.frame);
+		if (d.transfer_frame) av_frame_free(&d.transfer_frame);
 		if (d.ctx) avcodec_free_context(&d.ctx);
 		if (d.jpeg) {
 			tj3Destroy(d.jpeg);
@@ -513,6 +518,7 @@ private:
 		d.width = d.height = 0;
 		d.expected_fps_milli = 0;
 		d.first_frame_logged = false;
+		d.hw_pix_fmt = AV_PIX_FMT_NONE;
 		d.codec_id = AV_CODEC_ID_NONE;
 		d.has_jpeg_color_params = false;
 	}
@@ -523,28 +529,69 @@ private:
 		clear_decoder(d);
 		const AVCodec *codec = avcodec_find_decoder(id);
 		if (!codec || extra_size > 65535) return false;
-		d.ctx = avcodec_alloc_context3(codec);
-		if (!d.ctx) return false;
-		d.ctx->time_base = AVRational{1, 1000000000};
-		d.ctx->pkt_timebase = d.ctx->time_base;
-		d.ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
-		if (id == AV_CODEC_ID_H264) {
-			d.ctx->width = width;
-			d.ctx->height = height;
-			d.codec_id = id;
-		} else {
-			d.ctx->sample_rate = sample_rate;
-			av_channel_layout_default(&d.ctx->ch_layout, channels);
+		auto initialize = [&](bool use_d3d11va) {
+			d.ctx = avcodec_alloc_context3(codec);
+			if (!d.ctx) return false;
+			d.ctx->time_base = AVRational{1, 1000000000};
+			d.ctx->pkt_timebase = d.ctx->time_base;
+			d.ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
+			if (id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC) {
+				d.ctx->width = width;
+				d.ctx->height = height;
+				d.codec_id = id;
+			} else {
+				d.ctx->sample_rate = sample_rate;
+				av_channel_layout_default(&d.ctx->ch_layout, channels);
+			}
+			if (extra_size) {
+				d.ctx->extradata = static_cast<std::uint8_t *>(av_mallocz(extra_size + AV_INPUT_BUFFER_PADDING_SIZE));
+				if (!d.ctx->extradata) return false;
+				std::memcpy(d.ctx->extradata, extra, extra_size);
+				d.ctx->extradata_size = static_cast<int>(extra_size);
+			}
+			if (use_d3d11va) {
+				const AVCodecHWConfig *hw_config = nullptr;
+				for (int i = 0; (hw_config = avcodec_get_hw_config(codec, i)); ++i) {
+					if (hw_config->device_type == AV_HWDEVICE_TYPE_D3D11VA &&
+					    (hw_config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+						break;
+					hw_config = nullptr;
+				}
+				AVBufferRef *device = nullptr;
+				if (!hw_config || av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) < 0)
+					return false;
+				d.ctx->hw_device_ctx = av_buffer_ref(device);
+				av_buffer_unref(&device);
+				if (!d.ctx->hw_device_ctx) return false;
+				d.hw_pix_fmt = hw_config->pix_fmt;
+				d.ctx->opaque = &d;
+				d.ctx->get_format = [](AVCodecContext *ctx, const AVPixelFormat *formats) {
+					auto *decoder = static_cast<Decoder *>(ctx->opaque);
+					if (decoder && decoder->hw_pix_fmt != AV_PIX_FMT_NONE) {
+						for (const AVPixelFormat *format = formats; *format != AV_PIX_FMT_NONE; ++format)
+							if (*format == decoder->hw_pix_fmt) return *format;
+					}
+					return formats[0];
+				};
+			}
+			if (avcodec_open2(d.ctx, codec, nullptr) < 0) return false;
+			d.frame = av_frame_alloc();
+			if (use_d3d11va) d.transfer_frame = av_frame_alloc();
+			return d.frame && (!use_d3d11va || d.transfer_frame);
+		};
+
+		if ((id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC) && initialize(true)) {
+			blog(LOG_INFO, "DuoCast: using D3D11 hardware decoding for %s", video_codec_label(id));
+			return true;
 		}
-		if (extra_size) {
-			d.ctx->extradata = static_cast<std::uint8_t *>(av_mallocz(extra_size + AV_INPUT_BUFFER_PADDING_SIZE));
-			if (!d.ctx->extradata) { clear_decoder(d); return false; }
-			std::memcpy(d.ctx->extradata, extra, extra_size);
-			d.ctx->extradata_size = static_cast<int>(extra_size);
+		if (id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC) {
+			blog(LOG_WARNING, "DuoCast: D3D11 %s decoding unavailable; falling back to software decoding",
+			     video_codec_label(id));
+			clear_decoder(d);
 		}
-		if (avcodec_open2(d.ctx, codec, nullptr) < 0) { clear_decoder(d); return false; }
-		d.frame = av_frame_alloc();
-		return d.frame != nullptr;
+		if (initialize(false)) return true;
+		clear_decoder(d);
+		return false;
 	}
 
 	void setup_video(Decoder &decoder, const std::vector<std::uint8_t> &p, bool vertical)
@@ -554,6 +601,7 @@ private:
 		const auto extra_size = read16(p.data() + 17);
 		const auto codec_type = p[16];
 		const AVCodecID codec_id = codec_type == 1 ? AV_CODEC_ID_H264 :
+			codec_type == 5 ? AV_CODEC_ID_HEVC :
 			(codec_type == 2 || codec_type == 4) ? AV_CODEC_ID_MJPEG : AV_CODEC_ID_NONE;
 		const std::size_t color_bytes = codec_type == 4 ? 89 : 0;
 		if (codec_id == AV_CODEC_ID_NONE || !w || !h || w > 8192 || h > 8192 ||
@@ -570,7 +618,7 @@ private:
 				decoder.codec_id = AV_CODEC_ID_MJPEG;
 				opened = true;
 			} else clear_decoder(decoder);
-		} else if (codec_id == AV_CODEC_ID_H264) {
+		} else if (codec_id == AV_CODEC_ID_H264 || codec_id == AV_CODEC_ID_HEVC) {
 			opened = open_decoder(decoder, codec_id, static_cast<int>(w), static_cast<int>(h), 0, 0,
 					       p.data() + 19, extra_size);
 		}
@@ -637,23 +685,38 @@ private:
 		} else {
 			int receive_result = 0;
 			while ((receive_result = avcodec_receive_frame(d.ctx, d.frame)) == 0) {
-				const auto timestamp = d.frame->pts != AV_NOPTS_VALUE && d.frame->pts >= 0
-					? static_cast<std::uint64_t>(d.frame->pts) : pts;
+				AVFrame *decoded = d.frame;
+				if (d.hw_pix_fmt != AV_PIX_FMT_NONE && d.frame->format == d.hw_pix_fmt) {
+					av_frame_unref(d.transfer_frame);
+					const int transfer_result = av_hwframe_transfer_data(d.transfer_frame, d.frame, 0);
+					if (transfer_result < 0) {
+						char error[AV_ERROR_MAX_STRING_SIZE]{};
+						av_strerror(transfer_result, error, sizeof(error));
+						blog(LOG_WARNING, "DuoCast: D3D11 decoded frame transfer failed: %s", error);
+						av_frame_unref(d.frame);
+						continue;
+					}
+					av_frame_copy_props(d.transfer_frame, d.frame);
+					decoded = d.transfer_frame;
+				}
+				const auto timestamp = decoded->pts != AV_NOPTS_VALUE && decoded->pts >= 0
+					? static_cast<std::uint64_t>(decoded->pts) : pts;
 				if (!d.first_frame_logged) {
-					if (is_video && d.frame->data[0]) {
-						const char *pixel_format = av_get_pix_fmt_name(static_cast<AVPixelFormat>(d.frame->format));
+					if (is_video && decoded->data[0]) {
+						const char *pixel_format = av_get_pix_fmt_name(static_cast<AVPixelFormat>(decoded->format));
 						blog(LOG_INFO, "DuoCast: decoded first %s frame (%dx%d, format %s)",
-						     video_codec_label(d.codec_id), d.frame->width, d.frame->height,
+						     video_codec_label(d.codec_id), decoded->width, decoded->height,
 						     pixel_format ? pixel_format : "unknown");
 						d.first_frame_logged = true;
-					} else if (!is_video && d.frame->nb_samples > 0 && d.frame->data[0]) {
+					} else if (!is_video && decoded->nb_samples > 0 && decoded->data[0]) {
 						blog(LOG_INFO, "DuoCast: decoded first %s AAC frame (%d samples)",
-						     kind == StreamKind::LiveAudio ? "live" : "VOD", d.frame->nb_samples);
+						     kind == StreamKind::LiveAudio ? "live" : "VOD", decoded->nb_samples);
 						d.first_frame_logged = true;
 					}
 				}
-				if (is_video) deliver_video(d, d.frame, timestamp, kind);
-				else deliver_audio(d, d.frame, kind, timestamp);
+				if (is_video) deliver_video(d, decoded, timestamp, kind);
+				else deliver_audio(d, decoded, kind, timestamp);
+				if (decoded == d.transfer_frame) av_frame_unref(d.transfer_frame);
 				av_frame_unref(d.frame);
 			}
 			if (receive_result != AVERROR(EAGAIN) && receive_result != AVERROR_EOF) {
@@ -706,8 +769,7 @@ private:
 
 	void deliver_video(Decoder &d, AVFrame *decoded, std::uint64_t timestamp, StreamKind kind)
 	{
-		if ((decoded->format != AV_PIX_FMT_YUV420P && decoded->format != AV_PIX_FMT_YUVJ420P) || !decoded->data[0] ||
-		    !decoded->data[1] || !decoded->data[2]) return;
+		if (!decoded->data[0] || !decoded->data[1]) return;
 		// Follow Teleport's source handoff model: pass decoded planes through
 		// OBS's frame2 API with complete color metadata. The legacy frame API
 		// otherwise receives zeroed conversion parameters and renders black.
@@ -719,6 +781,26 @@ private:
 		else if (decoded->colorspace == AVCOL_SPC_BT470BG || decoded->colorspace == AVCOL_SPC_SMPTE170M)
 			colorspace = VIDEO_CS_601;
 		else if (decoded->colorspace == AVCOL_SPC_BT709) colorspace = VIDEO_CS_709;
+		if (decoded->format == AV_PIX_FMT_NV12 && !(decoded->width & 1) && !(decoded->height & 1)) {
+			std::vector<std::uint8_t> u(static_cast<std::size_t>(decoded->width) * decoded->height / 4);
+			std::vector<std::uint8_t> v(u.size());
+			for (std::uint32_t row = 0; row < decoded->height / 2; ++row) {
+				const auto *uv = decoded->data[1] + static_cast<std::ptrdiff_t>(row) * decoded->linesize[1];
+				auto *u_row = u.data() + static_cast<std::size_t>(row) * decoded->width / 2;
+				auto *v_row = v.data() + static_cast<std::size_t>(row) * decoded->width / 2;
+				for (std::uint32_t col = 0; col < decoded->width / 2; ++col) {
+					u_row[col] = uv[col * 2];
+					v_row[col] = uv[col * 2 + 1];
+				}
+			}
+			const int strides[] = {decoded->linesize[0], static_cast<int>(decoded->width / 2),
+					       static_cast<int>(decoded->width / 2)};
+			deliver_video_planes(decoded->data[0], u.data(), v.data(), strides, decoded->width,
+					    decoded->height, timestamp, kind, range, colorspace);
+			return;
+		}
+		if ((decoded->format != AV_PIX_FMT_YUV420P && decoded->format != AV_PIX_FMT_YUVJ420P) || !decoded->data[2])
+			return;
 		deliver_video_planes(decoded->data[0], decoded->data[1], decoded->data[2], decoded->linesize,
 				    decoded->width, decoded->height, timestamp, kind,
 				    d.has_jpeg_color_params ? d.jpeg_range : range, colorspace,

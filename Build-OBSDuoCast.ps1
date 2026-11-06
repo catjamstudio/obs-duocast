@@ -4,8 +4,8 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $versionSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'src\plugin.cpp')
-if (-not $BuildOnly -and $versionSource -notmatch 'OBS DuoCast %s \(Beta\) loaded", "0\.14\.25"') {
-	throw 'Build stopped: source version marker must be OBS DuoCast 0.14.25 Beta before installing.'
+if (-not $BuildOnly -and $versionSource -notmatch 'OBS DuoCast %s \(Beta\) loaded", "0\.14\.29"') {
+	throw 'Build stopped: source version marker must be OBS DuoCast 0.14.29 Beta before installing.'
 }
 $obsRoot = Join-Path $projectRoot 'obs_portable'
 $obsExe = Join-Path $obsRoot 'bin\64bit\obs64.exe'
@@ -18,7 +18,7 @@ $vsRoot = 'C:\Program Files\Microsoft Visual Studio\2022\Community'
 $toolRoot = Join-Path $vsRoot 'VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64'
 $vsDevCmd = Join-Path $vsRoot 'Common7\Tools\VsDevCmd.bat'
 $buildRoot = Join-Path $projectRoot 'build'
-$outputRoot = if ($BuildOnly) { Join-Path $buildRoot 'turbojpeg-0.14.25-source-build' } else { $buildRoot }
+$outputRoot = if ($BuildOnly) { Join-Path $buildRoot 'nvenc-0.14.29-source-build' } else { $buildRoot }
 
 if (-not (Test-Path $obsExe)) { throw "Portable OBS not found: $obsExe" }
 if (-not (Test-Path (Join-Path $libobsHeaders 'obs-module.h'))) { throw "OBS SDK headers not found: $libobsHeaders" }
@@ -147,5 +147,5 @@ if ($BuildOnly) {
 	Copy-Item -LiteralPath $pluginDll -Destination (Join-Path $pluginDir 'OBS-DuoCast.dll') -Force
 	Copy-Item -LiteralPath (Join-Path $turboJpegRoot 'bin\turbojpeg.dll') -Destination (Join-Path $pluginDir 'turbojpeg.dll') -Force
 	Copy-Item -LiteralPath (Join-Path $projectRoot 'data\locale\en-US.ini') -Destination (Join-Path $localeDir 'en-US.ini') -Force
-	Write-Output "Built and installed OBS DuoCast 0.14.25 Beta for portable OBS ${obsVersion}: $pluginDir\OBS-DuoCast.dll"
+	Write-Output "Built and installed OBS DuoCast 0.14.29 Beta for portable OBS ${obsVersion}: $pluginDir\OBS-DuoCast.dll"
 }

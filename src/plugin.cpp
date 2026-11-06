@@ -58,6 +58,8 @@ constexpr char kPortKey[] = "Port";
 constexpr char kLiveTrackKey[] = "LiveTrack";
 constexpr char kVodTrackKey[] = "VodTrack";
 constexpr char kVideoQualityKey[] = "VideoQuality";
+constexpr char kVideoEncoderModeKey[] = "VideoEncoderMode";
+constexpr char kNvencBitrateKey[] = "NvencBitrateMbps";
 constexpr char kMaxBitrateKey[] = "MaxBitrateMbps";
 constexpr char kMaxFpsKey[] = "MaxVideoFps";
 constexpr char kSendVerticalKey[] = "SendVerticalCanvas";
@@ -137,6 +139,9 @@ QComboBox *g_liveTrackCombo = nullptr;
 QComboBox *g_vodTrackCombo = nullptr;
 QSlider *g_qualitySlider = nullptr;
 QLabel *g_qualityPercentLabel = nullptr;
+QLabel *g_videoRateHintLabel = nullptr;
+QComboBox *g_videoEncoderCombo = nullptr;
+QSpinBox *g_nvencBitrateSpin = nullptr;
 QSpinBox *g_maxBitrateSpin = nullptr;
 QComboBox *g_maxFpsCombo = nullptr;
 QComboBox *g_videoResolutionCombo = nullptr;
@@ -165,7 +170,8 @@ void create_receiver_stats_dock();
 void update_receiver_stats_dock();
 void update_receiver_host_stats();
 bool start_sender(const std::string &host, int port, int live_track, int vod_track, int video_quality,
-		  int max_bitrate_mbps, int max_fps, bool send_vertical, int resolution_mode);
+		  int max_bitrate_mbps, int max_fps, bool send_vertical, int resolution_mode,
+		  int video_encoder_mode, int nvenc_bitrate_mbps);
 const char *control_source_name(void *) { return "OBS DuoCast Settings"; }
 void control_source_defaults(obs_data_t *settings);
 
@@ -280,6 +286,8 @@ struct ControlDraft {
 	int live_track = 1;
 	int vod_track = 2;
 	int video_quality = 85;
+	int video_encoder_mode = 0; // 0 = TurboJPEG MJPEG, 1 = NVENC H.264, 2 = NVENC HEVC
+	int nvenc_bitrate_mbps = 80;
 	int max_bitrate_mbps = 100;
 	int max_fps = 0;
 	int resolution_mode = 0; // 0 = OBS base canvas, 1 = OBS scaled output
@@ -318,6 +326,8 @@ ControlDraft draft_from_settings(obs_data_t *settings)
 	draft.live_track = std::clamp(static_cast<int>(obs_data_get_int(settings, "live_track")), 1, 6);
 	draft.vod_track = std::clamp(static_cast<int>(obs_data_get_int(settings, "vod_track")), 1, 6);
 	draft.video_quality = std::clamp(static_cast<int>(obs_data_get_int(settings, "video_quality")), 1, 100);
+	draft.video_encoder_mode = std::clamp(static_cast<int>(obs_data_get_int(settings, "video_encoder_mode")), 0, 2);
+	draft.nvenc_bitrate_mbps = std::clamp(static_cast<int>(obs_data_get_int(settings, "nvenc_bitrate_mbps")), 1, 1000);
 	draft.max_bitrate_mbps = std::clamp(static_cast<int>(obs_data_get_int(settings, "max_bitrate_mbps")), 0, 1000);
 	draft.max_fps = std::clamp(static_cast<int>(obs_data_get_int(settings, "max_fps")), 0, 120);
 	draft.resolution_mode = std::clamp(static_cast<int>(obs_data_get_int(settings, "resolution_mode")), 0, 1);
@@ -346,6 +356,8 @@ bool persist_draft(bool sender_configured = false)
 	config_set_int(cfg, kConfigSection, kLiveTrackKey, draft.live_track);
 	config_set_int(cfg, kConfigSection, kVodTrackKey, draft.vod_track);
 	config_set_int(cfg, kConfigSection, kVideoQualityKey, draft.video_quality);
+	config_set_int(cfg, kConfigSection, kVideoEncoderModeKey, draft.video_encoder_mode);
+	config_set_int(cfg, kConfigSection, kNvencBitrateKey, draft.nvenc_bitrate_mbps);
 	config_set_int(cfg, kConfigSection, kMaxBitrateKey, draft.max_bitrate_mbps);
 	config_set_int(cfg, kConfigSection, kMaxFpsKey, draft.max_fps);
 	config_set_int(cfg, kConfigSection, kVideoResolutionKey, draft.resolution_mode);
@@ -378,6 +390,8 @@ bool apply_draft_to_source(obs_source_t *target = nullptr)
 	obs_data_set_int(settings, "live_track", draft.live_track);
 	obs_data_set_int(settings, "vod_track", draft.vod_track);
 	obs_data_set_int(settings, "video_quality", draft.video_quality);
+	obs_data_set_int(settings, "video_encoder_mode", draft.video_encoder_mode);
+	obs_data_set_int(settings, "nvenc_bitrate_mbps", draft.nvenc_bitrate_mbps);
 	obs_data_set_int(settings, "max_bitrate_mbps", draft.max_bitrate_mbps);
 	obs_data_set_int(settings, "max_fps", draft.max_fps);
 	obs_data_set_int(settings, "resolution_mode", draft.resolution_mode);
@@ -423,7 +437,7 @@ bool start_sender_clicked(obs_properties_t *, obs_property_t *, void *)
  const auto draft = control_draft_snapshot();
  const bool started = start_sender(draft.destination, draft.port, draft.live_track, draft.vod_track,
 	                                   draft.video_quality, draft.max_bitrate_mbps, draft.max_fps, draft.send_vertical,
-	                                   draft.resolution_mode);
+	                                   draft.resolution_mode, draft.video_encoder_mode, draft.nvenc_bitrate_mbps);
  blog(started ? LOG_INFO : LOG_ERROR, "DuoCast: sender %s", started ? "started" : "could not start");
  if (g_senderControlSource) obs_source_update_properties(g_senderControlSource);
  if (g_receiverControlSource) obs_source_update_properties(g_receiverControlSource);
@@ -1077,7 +1091,8 @@ void create_sender_dock()
 		draft = control_draft_snapshot();
 		const bool started = start_sender(draft.destination, draft.port, draft.live_track, draft.vod_track,
 						  draft.video_quality, draft.max_bitrate_mbps, draft.max_fps,
-						  draft.send_vertical, draft.resolution_mode);
+						  draft.send_vertical, draft.resolution_mode, draft.video_encoder_mode,
+						  draft.nvenc_bitrate_mbps);
 		blog(started ? LOG_INFO : LOG_ERROR, "DuoCast quick control: sender %s",
 		     started ? "started" : "could not start");
 		update_duocast_window();
@@ -1301,6 +1316,8 @@ void read_ui_into_draft()
 	if (g_liveTrackCombo) draft.live_track = g_liveTrackCombo->currentData().toInt();
 	if (g_vodTrackCombo) draft.vod_track = g_vodTrackCombo->currentData().toInt();
 	if (g_qualitySlider) draft.video_quality = g_qualitySlider->value();
+	if (g_videoEncoderCombo) draft.video_encoder_mode = g_videoEncoderCombo->currentData().toInt();
+	if (g_nvencBitrateSpin) draft.nvenc_bitrate_mbps = g_nvencBitrateSpin->value();
 	if (g_maxBitrateSpin) draft.max_bitrate_mbps = g_maxBitrateSpin->value();
 	if (g_maxFpsCombo) draft.max_fps = g_maxFpsCombo->currentData().toInt();
 	if (g_videoResolutionCombo) draft.resolution_mode = g_videoResolutionCombo->currentData().toInt();
@@ -1349,7 +1366,7 @@ void show_duocast_tool(void *)
 	g_enableSenderCheck->setChecked(draft.enable_sender);
 	g_enableReceiverCheck = new QCheckBox("Enable DuoCast Receiver");
 	g_enableReceiverCheck->setChecked(draft.enable_receiver);
-	auto *version = new QLabel("OBS DuoCast 0.14.25 Beta"); version->setStyleSheet("color:#aeb4bd;");
+	auto *version = new QLabel("OBS DuoCast 0.14.29 Beta"); version->setStyleSheet("color:#aeb4bd;");
 	header->addWidget(title); header->addSpacing(18); header->addWidget(g_enableSenderCheck); header->addWidget(g_enableReceiverCheck); header->addStretch(); header->addWidget(version); root->addLayout(header);
 	auto *tabs = new QTabWidget; root->addWidget(tabs, 1);
 	auto *senderPage = new QWidget; auto *senderLayout = new QVBoxLayout(senderPage);
@@ -1368,21 +1385,32 @@ void show_duocast_tool(void *)
 	g_liveTrackCombo = new QComboBox; g_vodTrackCombo = new QComboBox;
 	for (int i=1;i<=6;++i) { const QString label = QString("Track %1").arg(i); g_liveTrackCombo->addItem(label,i); g_vodTrackCombo->addItem(label,i); }
 	g_liveTrackCombo->setCurrentIndex(g_liveTrackCombo->findData(draft.live_track)); g_vodTrackCombo->setCurrentIndex(g_vodTrackCombo->findData(draft.vod_track));
+	g_videoEncoderCombo = new QComboBox;
+	g_videoEncoderCombo->addItem("MJPEG (TurboJPEG)", 0);
+	g_videoEncoderCombo->addItem("NVENC H.264 (GPU texture)", 1);
+	g_videoEncoderCombo->addItem("NVENC HEVC / H.265 (GPU texture)", 2);
+	g_videoEncoderCombo->setCurrentIndex(g_videoEncoderCombo->findData(draft.video_encoder_mode));
+	g_videoEncoderCombo->setToolTip("Choose MJPEG, NVENC H.264, or NVENC HEVC/H.265. HEVC requires sender NVENC and receiver decoder support.");
 	auto *qualityRow = new QWidget; auto *qualityLayout = new QHBoxLayout(qualityRow); qualityLayout->setContentsMargins(0,0,0,0); qualityLayout->setSpacing(10);
 	g_qualitySlider = new QSlider(Qt::Horizontal); g_qualitySlider->setRange(1,100); g_qualitySlider->setValue(draft.video_quality);
-	g_qualitySlider->setToolTip("TurboJPEG image quality. Higher values preserve more detail and use more bandwidth.");
+	g_qualitySlider->setToolTip("MJPEG mode only. Higher TurboJPEG quality preserves more detail and uses more bandwidth.");
 	g_qualityPercentLabel = new QLabel(QString("%1%").arg(g_qualitySlider->value())); g_qualityPercentLabel->setMinimumWidth(42); g_qualityPercentLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
 	qualityLayout->addWidget(g_qualitySlider,1); qualityLayout->addWidget(g_qualityPercentLabel);
-	g_maxBitrateSpin = new QSpinBox; g_maxBitrateSpin->setRange(0, 1000); g_maxBitrateSpin->setSpecialValueText("Auto"); g_maxBitrateSpin->setSuffix(" Mbps");
+	g_maxBitrateSpin = new QSpinBox; g_maxBitrateSpin->setRange(0, 1000); g_maxBitrateSpin->setSpecialValueText("No cap"); g_maxBitrateSpin->setSuffix(" Mbps");
 	g_maxBitrateSpin->setValue(draft.max_bitrate_mbps);
-	g_maxBitrateSpin->setToolTip("0 (Auto) disables bitrate pacing. A numeric cap paces total TCP output; JPEG quality stays at the selected value.");
+	g_maxBitrateSpin->setToolTip("Shared network pacing limit for landscape video, optional portrait video, and both audio tracks. 0 disables pacing.");
+	g_nvencBitrateSpin = new QSpinBox; g_nvencBitrateSpin->setRange(1, 1000); g_nvencBitrateSpin->setSuffix(" Mbps");
+	g_nvencBitrateSpin->setValue(draft.nvenc_bitrate_mbps);
+	g_nvencBitrateSpin->setToolTip("NVENC CBR video target per feed. If portrait is enabled, there are two encoders using this target.");
+	g_videoRateHintLabel = new QLabel; g_videoRateHintLabel->setWordWrap(true);
+	g_videoRateHintLabel->setStyleSheet("color:#aeb4bd; font-size:9pt;");
 	g_maxFpsCombo = new QComboBox;
 	g_maxFpsCombo->addItem("Canvas FPS (no cap)", 0);
 	for (const int fps : {120, 60, 50, 30, 25, 24, 20, 15})
 		g_maxFpsCombo->addItem(QString("%1 FPS").arg(fps), fps);
 	const int fpsIndex = g_maxFpsCombo->findData(draft.max_fps);
 	g_maxFpsCombo->setCurrentIndex(fpsIndex >= 0 ? fpsIndex : 0);
-	g_maxFpsCombo->setToolTip("Applies to both outgoing feeds. Frames above the selected cap are skipped before JPEG compression.");
+	g_maxFpsCombo->setToolTip("Applies to both outgoing feeds. Frames above the selected cap are skipped before encoding; NVENC uses OBS frame-rate pacing.");
 	g_videoResolutionCombo = new QComboBox;
 	g_videoResolutionCombo->addItem("OBS canvas resolution", 0);
 	g_videoResolutionCombo->addItem("OBS output resolution", 1);
@@ -1392,7 +1420,33 @@ void show_duocast_tool(void *)
 	g_sendVerticalCheck = new QCheckBox("Send Aitum Vertical canvas");
 	g_sendVerticalCheck->setChecked(draft.send_vertical);
 	g_sendVerticalCheck->setToolTip("Optional. DuoCast checks for an active Aitum Vertical canvas when you enable this option.");
-	senderForm->addRow("Receiver address",g_destinationEdit); senderForm->addRow("Port",g_portSpin); senderForm->addRow("Live mix track",g_liveTrackCombo); senderForm->addRow("VOD mix track",g_vodTrackCombo); senderForm->addRow("Video resolution",g_videoResolutionCombo); senderForm->addRow("Video quality",qualityRow); senderForm->addRow("Max total bitrate",g_maxBitrateSpin); senderForm->addRow("Max video FPS",g_maxFpsCombo); senderForm->addRow("",g_sendVerticalCheck); senderForm->addRow("",g_autostartCheck); senderLayout->addLayout(senderForm);
+	senderForm->addRow("Receiver address",g_destinationEdit); senderForm->addRow("Port",g_portSpin); senderForm->addRow("Live mix track",g_liveTrackCombo); senderForm->addRow("VOD mix track",g_vodTrackCombo); senderForm->addRow("Video encoder",g_videoEncoderCombo); senderForm->addRow("MJPEG quality",qualityRow); senderForm->addRow("NVENC bitrate per feed",g_nvencBitrateSpin); senderForm->addRow("Total network cap",g_maxBitrateSpin); senderForm->addRow("",g_videoRateHintLabel); senderForm->addRow("Max video FPS",g_maxFpsCombo); senderForm->addRow("Video resolution",g_videoResolutionCombo); senderForm->addRow("",g_sendVerticalCheck); senderForm->addRow("",g_autostartCheck); senderLayout->addLayout(senderForm);
+	auto update_video_rate_controls = [senderForm, qualityRow] {
+		const int mode = g_videoEncoderCombo ? g_videoEncoderCombo->currentData().toInt() : 0;
+		const bool nvenc = mode > 0;
+		g_qualitySlider->setEnabled(!nvenc);
+		g_qualityPercentLabel->setEnabled(!nvenc);
+		g_nvencBitrateSpin->setEnabled(nvenc);
+		if (auto *label = senderForm->labelForField(qualityRow)) label->setVisible(!nvenc);
+		qualityRow->setVisible(!nvenc);
+		if (auto *label = senderForm->labelForField(g_nvencBitrateSpin)) label->setVisible(nvenc);
+		g_nvencBitrateSpin->setVisible(nvenc);
+		if (!nvenc) {
+			g_videoRateHintLabel->setText("MJPEG quality controls compression per frame. The total network cap is shared by all video feeds and both audio tracks; lowering it can reduce delivered FPS.");
+		} else {
+			const int feeds = g_sendVerticalCheck && g_sendVerticalCheck->isChecked() ? 2 : 1;
+			const int videoTarget = g_nvencBitrateSpin->value() * feeds;
+			const int cap = g_maxBitrateSpin->value();
+			QString message = QString("NVENC target is %1 Mbps per video feed (%2 Mbps combined video target%3). Total network cap includes all feeds and audio.")
+				.arg(g_nvencBitrateSpin->value()).arg(videoTarget)
+				.arg(feeds == 2 ? " with portrait" : "");
+			if (cap == 0) message += " No cap is applied.";
+			else if (cap <= videoTarget) message += QString(" Current %1 Mbps cap is below the combined video target and will throttle frames.").arg(cap);
+			else message += QString(" Current cap leaves about %1 Mbps for audio and overhead.").arg(cap - videoTarget);
+			g_videoRateHintLabel->setText(message);
+		}
+	};
+	update_video_rate_controls();
 	auto *sendButtons = new QHBoxLayout; sendButtons->setSpacing(8); g_startButton = new QPushButton("Start sending"); g_stopButton = new QPushButton("Stop sending"); sendButtons->addWidget(g_startButton); sendButtons->addWidget(g_stopButton); sendButtons->addStretch(); senderLayout->addLayout(sendButtons);
 	auto *connectionStrip = new QFrame; connectionStrip->setObjectName("connectionStrip");
 	auto *connectionLayout = new QHBoxLayout(connectionStrip); connectionLayout->setContentsMargins(10,5,10,5); connectionLayout->setSpacing(12);
@@ -1444,7 +1498,7 @@ void show_duocast_tool(void *)
 	blog(LOG_INFO, "DuoCast UI: receiver page built; connecting controls");
 	auto *footer = new QHBoxLayout; g_saveFeedbackLabel = new QLabel; g_saveFeedbackLabel->setStyleSheet("color:#62d996;font-weight:600;"); g_saveFeedbackLabel->setVisible(false); auto *save = new QPushButton("Save settings"); footer->addWidget(g_saveFeedbackLabel); footer->addStretch(); footer->addWidget(save); root->addLayout(footer);
 	QObject::connect(save,&QPushButton::clicked,dialog,save_ui_settings);
-	QObject::connect(g_startButton,&QPushButton::clicked,dialog,[] { read_ui_into_draft(); save_ui_settings(); const auto d=control_draft_snapshot(); start_sender(d.destination,d.port,d.live_track,d.vod_track,d.video_quality,d.max_bitrate_mbps,d.max_fps,d.send_vertical,d.resolution_mode); update_duocast_window(); });
+	QObject::connect(g_startButton,&QPushButton::clicked,dialog,[] { read_ui_into_draft(); save_ui_settings(); const auto d=control_draft_snapshot(); start_sender(d.destination,d.port,d.live_track,d.vod_track,d.video_quality,d.max_bitrate_mbps,d.max_fps,d.send_vertical,d.resolution_mode,d.video_encoder_mode,d.nvenc_bitrate_mbps); update_duocast_window(); });
 	QObject::connect(g_stopButton,&QPushButton::clicked,dialog,[] { stop_sender(); update_duocast_window(); });
 	QObject::connect(tabs, &QTabWidget::currentChanged, dialog, [draft, verticalScenesLoaded = false](int index) mutable {
 		if (index != 1 || verticalScenesLoaded) return;
@@ -1469,11 +1523,17 @@ void show_duocast_tool(void *)
 	QObject::connect(g_destinationEdit,&QLineEdit::textChanged,dialog,read_ui_into_draft);
 	QObject::connect(g_portSpin,qOverload<int>(&QSpinBox::valueChanged),dialog,read_ui_into_draft);
 	QObject::connect(g_qualitySlider,&QSlider::valueChanged,dialog,[](int value) { if (g_qualityPercentLabel) g_qualityPercentLabel->setText(QString("%1%").arg(value)); read_ui_into_draft(); });
-	QObject::connect(g_maxBitrateSpin,qOverload<int>(&QSpinBox::valueChanged),dialog,read_ui_into_draft);
+	QObject::connect(g_videoEncoderCombo,qOverload<int>(&QComboBox::currentIndexChanged),dialog,[dialog, update_video_rate_controls](int) {
+		update_video_rate_controls();
+		read_ui_into_draft();
+		save_ui_settings();
+	});
+	QObject::connect(g_nvencBitrateSpin,qOverload<int>(&QSpinBox::valueChanged),dialog,[update_video_rate_controls](int) { update_video_rate_controls(); read_ui_into_draft(); });
+	QObject::connect(g_maxBitrateSpin,qOverload<int>(&QSpinBox::valueChanged),dialog,[update_video_rate_controls](int) { update_video_rate_controls(); read_ui_into_draft(); });
 	QObject::connect(g_maxFpsCombo,qOverload<int>(&QComboBox::currentIndexChanged),dialog,read_ui_into_draft);
 	QObject::connect(g_videoResolutionCombo,qOverload<int>(&QComboBox::currentIndexChanged),dialog,read_ui_into_draft);
 	QObject::connect(g_autostartCheck,&QCheckBox::toggled,dialog,read_ui_into_draft);
-	QObject::connect(g_sendVerticalCheck,&QCheckBox::toggled,dialog,[preview, dialog](bool enabled) {
+	QObject::connect(g_sendVerticalCheck,&QCheckBox::toggled,dialog,[preview, dialog, update_video_rate_controls](bool enabled) {
 		if (enabled && !sender_vertical_canvas_available()) {
 			blog(LOG_WARNING, "DuoCast UI: Aitum Vertical sending requested but no canvas is available");
 			const QSignalBlocker blocker(g_sendVerticalCheck);
@@ -1481,6 +1541,7 @@ void show_duocast_tool(void *)
 			return;
 		}
 		preview->setVerticalEnabled(enabled);
+		update_video_rate_controls();
 		const int requiredWidth = enabled ? preview->previewContentWidth() + 48 : 900;
 		dialog->setMinimumWidth(requiredWidth);
 		if (enabled && dialog->width() < requiredWidth) dialog->resize(requiredWidth, dialog->height());
@@ -1503,7 +1564,8 @@ void show_duocast_tool(void *)
 			config_t *cfg = profile_config();
 			if (d.autostart && cfg)
 				start_sender(d.destination, d.port, d.live_track, d.vod_track, d.video_quality, d.max_bitrate_mbps,
-					     d.max_fps, d.send_vertical, d.resolution_mode);
+					     d.max_fps, d.send_vertical, d.resolution_mode, d.video_encoder_mode,
+					     d.nvenc_bitrate_mbps);
 		}
 		update_duocast_window();
 	});
@@ -1522,7 +1584,7 @@ void show_duocast_tool(void *)
 obs_properties_t *control_source_properties(void *opaque)
 {
 	auto *props = obs_properties_create();
-	obs_properties_add_text(props, "duocast_version", "OBS DuoCast 0.14.25 (Beta)", OBS_TEXT_INFO);
+	obs_properties_add_text(props, "duocast_version", "OBS DuoCast 0.14.29 (Beta)", OBS_TEXT_INFO);
 	const auto *state = static_cast<ControlSourceState *>(opaque);
 	if (state && state->view == ToolView::Receiver) {
 		auto *receiver = obs_properties_create();
@@ -1612,15 +1674,23 @@ obs_properties_t *control_source_properties(void *opaque)
 						   OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(resolution, "OBS canvas resolution", 0);
 	obs_property_list_add_int(resolution, "OBS output resolution", 1);
+	auto *videoEncoder = obs_properties_add_list(sender, "video_encoder_mode", "Video encoder",
+						     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(videoEncoder, "MJPEG (TurboJPEG)", 0);
+	obs_property_list_add_int(videoEncoder, "NVENC H.264 (GPU texture)", 1);
+	obs_property_list_add_int(videoEncoder, "NVENC HEVC / H.265 (GPU texture)", 2);
+	auto *nvencBitrate = obs_properties_add_int(sender, "nvenc_bitrate_mbps", "NVENC video bitrate per feed (Mbps)", 1, 1000, 1);
+	obs_property_set_long_description(nvencBitrate,
+		"CBR video target for each NVENC feed. With portrait enabled, two encoders use this target. The total network cap independently paces all video and audio traffic.");
 	auto *quality = obs_properties_add_int_slider(sender, "video_quality", "Video quality (%)", 1, 100, 1);
 	obs_property_set_long_description(quality,
-		"This is the fixed JPEG quality used for every frame. Higher values preserve more detail and use more bandwidth.");
-	auto *bitrateCap = obs_properties_add_int(sender, "max_bitrate_mbps", "Max total bitrate (Mbps; 0 = Auto)", 0, 1000, 1);
+		"MJPEG mode only: fixed JPEG quality for every frame. Higher values preserve more detail and use more bandwidth.");
+	auto *bitrateCap = obs_properties_add_int(sender, "max_bitrate_mbps", "Total network cap (Mbps; 0 = no cap)", 0, 1000, 1);
 	obs_property_set_long_description(bitrateCap,
-		"Set to 0 for Auto. A numeric value paces total network traffic. JPEG quality remains fixed; if the cap is too low, stale queued video frames may be dropped.");
+		"A shared pacing limit for landscape video, optional portrait video, and both audio tracks. Set to 0 for no pacing. If lower than the combined NVENC video targets, it will throttle frames.");
 	auto *fpsCap = obs_properties_add_int(sender, "max_fps", "Max video FPS (0 = canvas FPS)", 0, 120, 1);
 	obs_property_set_long_description(fpsCap,
-		"Applies to both outgoing video feeds. Frames above the selected rate are skipped before JPEG compression.");
+		"Applies to both outgoing video feeds. Frames above the selected rate are skipped before encoding; NVENC uses OBS frame-rate pacing.");
 	auto *autostart = obs_properties_add_bool(sender, "autostart", "Start sending automatically when OBS opens");
 	auto *vertical = obs_properties_add_bool(sender, "send_vertical", "Send Aitum Vertical canvas");
 	obs_property_set_enabled(vertical, sender_vertical_canvas_available());
@@ -1633,7 +1703,7 @@ obs_properties_t *control_source_properties(void *opaque)
 
 	obs_properties_add_button2(props, "save_settings", "Save Settings", save_settings_clicked, const_cast<ControlSourceState *>(state));
 
-	for (auto *property : {destination, port, live, vod, resolution, quality, bitrateCap, fpsCap, autostart, vertical})
+	for (auto *property : {destination, port, live, vod, resolution, videoEncoder, nvencBitrate, quality, bitrateCap, fpsCap, autostart, vertical})
 		obs_property_set_modified_callback2(property, control_setting_changed, nullptr);
 	return props;
 }
@@ -1665,6 +1735,8 @@ void control_source_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "live_track", cfg ? config_get_int(cfg, kConfigSection, kLiveTrackKey) : 1);
 	obs_data_set_default_int(settings, "vod_track", cfg ? config_get_int(cfg, kConfigSection, kVodTrackKey) : 2);
 	obs_data_set_default_int(settings, "video_quality", cfg ? config_get_int(cfg, kConfigSection, kVideoQualityKey) : 85);
+	obs_data_set_default_int(settings, "video_encoder_mode", cfg ? config_get_int(cfg, kConfigSection, kVideoEncoderModeKey) : 0);
+	obs_data_set_default_int(settings, "nvenc_bitrate_mbps", cfg ? config_get_int(cfg, kConfigSection, kNvencBitrateKey) : 80);
 	obs_data_set_default_int(settings, "max_bitrate_mbps", cfg ? config_get_int(cfg, kConfigSection, kMaxBitrateKey) : 100);
 	obs_data_set_default_int(settings, "max_fps", cfg ? config_get_int(cfg, kConfigSection, kMaxFpsKey) : 0);
 	obs_data_set_default_int(settings, "resolution_mode", cfg ? config_get_int(cfg, kConfigSection, kVideoResolutionKey) : 0);
@@ -1680,7 +1752,7 @@ void control_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "landscape_live_scene", cfg ? config_get_string(cfg, kConfigSection, kLandscapeLiveSceneKey) : "");
 	obs_data_set_default_string(settings, "vertical_live_scene", cfg ? config_get_string(cfg, kConfigSection, kVerticalLiveSceneKey) : "");
 	obs_data_set_default_bool(settings, "force_auto_switch_live", cfg && config_get_bool(cfg, kConfigSection, kForceAutoSwitchLiveKey));
-	obs_data_set_default_string(settings, "duocast_version", "OBS DuoCast 0.14.25 (Beta)");
+	obs_data_set_default_string(settings, "duocast_version", "OBS DuoCast 0.14.29 (Beta)");
 }
 
 std::string current_scene_name()
@@ -1799,7 +1871,8 @@ void monitor_receiver_fallback()
 }
 
 bool start_sender(const std::string &host, int port, int live_track, int vod_track, int video_quality,
-		  int max_bitrate_mbps, int max_fps, bool send_vertical, int resolution_mode)
+		  int max_bitrate_mbps, int max_fps, bool send_vertical, int resolution_mode,
+		  int video_encoder_mode, int nvenc_bitrate_mbps)
 {
 	if (!control_draft_snapshot().enable_sender) {
 		blog(LOG_WARNING, "DuoCast: sender start blocked because DuoCast is disabled");
@@ -1823,6 +1896,8 @@ bool start_sender(const std::string &host, int port, int live_track, int vod_tra
 	obs_data_set_int(settings, "live_mix", live_track);
 	obs_data_set_int(settings, "vod_mix", vod_track);
 	obs_data_set_int(settings, "video_quality", video_quality);
+	obs_data_set_int(settings, "video_encoder_mode", std::clamp(video_encoder_mode, 0, 2));
+	obs_data_set_int(settings, "nvenc_bitrate_mbps", std::clamp(nvenc_bitrate_mbps, 1, 1000));
 	obs_data_set_int(settings, "max_bitrate_mbps", std::clamp(max_bitrate_mbps, 0, 1000));
 	obs_data_set_int(settings, "max_fps", std::clamp(max_fps, 0, 120));
 	obs_data_set_bool(settings, "send_vertical", send_vertical);
@@ -1862,6 +1937,8 @@ bool start_sender_from_saved_preferences()
 	const int live = static_cast<int>(config_get_int(cfg, kConfigSection, kLiveTrackKey));
 	const int vod = static_cast<int>(config_get_int(cfg, kConfigSection, kVodTrackKey));
 	const int quality = static_cast<int>(config_get_int(cfg, kConfigSection, kVideoQualityKey));
+	const int video_encoder_mode = std::clamp(static_cast<int>(config_get_int(cfg, kConfigSection, kVideoEncoderModeKey)), 0, 2);
+	const int nvenc_bitrate_mbps = std::clamp(static_cast<int>(config_get_int(cfg, kConfigSection, kNvencBitrateKey)), 1, 1000);
 	const int max_bitrate = static_cast<int>(config_get_int(cfg, kConfigSection, kMaxBitrateKey));
 	const int max_fps = static_cast<int>(config_get_int(cfg, kConfigSection, kMaxFpsKey));
 	const bool send_vertical = config_get_bool(cfg, kConfigSection, kSendVerticalKey);
@@ -1869,7 +1946,7 @@ bool start_sender_from_saved_preferences()
 	const bool started = start_sender(host, std::clamp(port, 1, 65535), std::clamp(live, 1, 6),
 					  std::clamp(vod, 1, 6), std::clamp(quality, 1, 100),
 					  std::clamp(max_bitrate, 0, 1000), std::clamp(max_fps, 0, 120), send_vertical,
-					  resolution_mode);
+					  resolution_mode, video_encoder_mode, nvenc_bitrate_mbps);
 	blog(started ? LOG_INFO : LOG_ERROR, "DuoCast: saved sender autostart %s", started ? "started" : "failed");
 	return started;
 }
@@ -2054,7 +2131,7 @@ bool obs_module_load(void)
 	obs_frontend_add_tools_menu_item("DuoCast", show_duocast_tool, nullptr);
 	create_sender_dock();
 	create_receiver_stats_dock();
-	blog(LOG_INFO, "OBS DuoCast %s (Beta) loaded", "0.14.25");
+	blog(LOG_INFO, "OBS DuoCast %s (Beta) loaded", "0.14.29");
 	return true;
 }
 

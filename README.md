@@ -1,12 +1,12 @@
 # OBS DuoCast
 
-**Current development build:** 0.14.25 Beta for Windows x64 / OBS Studio 32.2.2.
+**Current development build:** 0.14.29 Beta for Windows x64 / OBS Studio 32.2.2.
 **Fallback build:** 0.14.13 Stable remains available if you need to roll back.
 
-The 0.14.25 build follows the 0.14.13 Stable MJPEG behavior and adds the
-sender's output-resolution option, Kbps audio stat cards, an adjustable
-receiver A/V sync buffer, and automatic low-FPS feed recovery. NVENC and the
-experimental PTS-DTS offset change are excluded.
+The 0.14.29 build continues from the 0.14.25 Beta checkpoint. MJPEG remains the
+default, with optional texture-passed NVENC H.264 and HEVC/H.265 sender modes.
+NVENC video bitrate is configurable per feed. The receiver supports D3D11 H.264
+and HEVC decoding with software fallback. AAC audio transport is unchanged.
 
 OBS DuoCast relays the composed OBS program output and two selected OBS audio
 tracks over a timestamped TCP connection. The receiving PC does not recreate
@@ -16,7 +16,7 @@ independent canvas.
 
 ## Install
 
-Use `dist/OBS-DuoCast-0.14.25-Beta-Windows-x64.zip` for the MJPEG-only sender and receiver with the output-resolution option, Kbps audio stat cards, receiver sync buffering, automatic low-FPS recovery and fixed TurboJPEG quality with independent bitrate pacing.
+Use `dist/OBS-DuoCast-0.14.29-Beta-Windows-x64.zip` for the sender and receiver with MJPEG, NVENC H.264, or NVENC HEVC video, output-resolution selection, Kbps audio stat cards, receiver sync buffering, and automatic low-FPS recovery.
 Use `dist/OBS-DuoCast-0.14.13-Stable-Windows-x64.zip` to roll back. Close OBS before installing.
 The ZIP contains both OBS's new per-plugin layout and the legacy plugin folders.
 For OBS 33.0+ Portable, extract it into the portable root; for a standard OBS
@@ -32,17 +32,20 @@ package is installed on sender and receiver PCs.
 Open **Tools → DuoCast**. Turn on **Enable DuoCast Sender**, select the live mix
 and music-free VOD tracks, then start sending. Sender and receiver have
 independent enable switches, both off by default. The sender address defaults to
-`192.168.50.102`, port `17777`. Video uses TurboJPEG MJPEG. The selected JPEG
-quality is applied to every frame. A bitrate cap paces TCP writes independently
-of image quality; stale queued video frames are dropped if the network falls
-behind, so a cap below the sustained feed rate can reduce delivered FPS. The
-output-resolution option can reduce compression work
-when OBS's scaled output is smaller than its canvas.
+`192.168.50.102`, port `17777`. Video defaults to TurboJPEG MJPEG; NVENC H.264
+and HEVC/H.265 are optional GPU encoders. The JPEG quality slider applies only
+to MJPEG. NVENC uses CBR and its bitrate is the target for each feed. The
+separate total network cap paces all video feeds and both audio tracks. With
+portrait enabled, account for two NVENC video targets when setting the shared
+cap. The sender UI shows the combined target and warns when the cap will throttle
+frames. Set the cap to 0 to disable network pacing. The output-resolution
+option can reduce encoding work when OBS's scaled output is smaller than its
+canvas.
 The optional max FPS
 cap applies to both feeds; sender stats show the actual outgoing FPS. Optional
 portrait sending requires Aitum Vertical installed and configured on the sender
-PC. Install 0.14.25 on both PCs for matching sender and receiver behavior. The
-sender emits MJPEG; the receiver retains legacy H.264 decode compatibility.
+PC. Install 0.14.29 on both PCs for matching sender and receiver behavior. The
+receiver supports MJPEG, H.264, and HEVC.
 
 The sender also provides a **DuoCast Receiver Stats** dock. It receives the
 streaming PC's OBS performance/output statistics over the existing TCP session,
@@ -74,6 +77,9 @@ queue is bounded at 256 MiB to prevent unbounded memory growth during a stalled
 receiver. This fixed playout delay absorbs jitter; it does not alter sender
 timestamps or guarantee correction for sustained packet loss or a receiver that
 cannot decode fast enough.
+For H.264 and HEVC, the receiver attempts D3D11 hardware decoding first and
+falls back to software decoding if the local FFmpeg runtime or GPU cannot use
+it. Decoded frames are copied back to system memory for OBS source output.
 
 Automatic low-FPS recovery is enabled by default and can be switched off in
 Receiver settings. After startup warm-up, if decoded FPS remains below 60% of
@@ -90,11 +96,11 @@ fallback scenes.
 
 ## Transport and build
 
-The 0.14.25 Beta sends TurboJPEG MJPEG and can use either OBS canvas or scaled
-output dimensions. The sender compresses OBS's I420 planes directly, avoiding
-an extra FFmpeg MJPEG conversion step. DuoCast keeps its timestamped TCP
-transport and AAC audio mixes; FFmpeg on the receiver is used for AAC decoding.
-The sender maps OBS system timestamps to its shared timeline.
+The 0.14.29 Beta sends TurboJPEG MJPEG or OBS texture-passed NVENC H.264/HEVC
+and can use either OBS canvas or scaled output dimensions. NVENC uses OBS's GPU
+texture encoder, with B-frames disabled so video decode and audio stay on the
+shared sender system-time timeline. DuoCast keeps its timestamped TCP transport
+and AAC audio mixes; FFmpeg on the receiver decodes AAC, H.264, and HEVC.
 Sender and receiver reconnect over TCP. The transport has no encryption or
 authentication; use it on a trusted LAN. FFmpeg DLLs are provided by OBS.
 

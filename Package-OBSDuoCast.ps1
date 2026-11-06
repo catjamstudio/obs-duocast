@@ -8,10 +8,10 @@ $turboJpegLicense = Join-Path $projectRoot '.deps\libjpeg-turbo-3.2.0\sdk\doc\LI
 $turboJpegIjgLicense = Join-Path $projectRoot '.deps\libjpeg-turbo-3.2.0\sdk\doc\README.ijg'
 $localeSource = Join-Path $projectRoot 'data\locale\en-US.ini'
 $versionSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'src\plugin.cpp')
-if ($versionSource -notmatch 'OBS DuoCast %s \(Beta\) loaded", "0\.14\.25"') {
-	throw 'Packaging stopped: source version marker must be OBS DuoCast 0.14.25 Beta.'
+if ($versionSource -notmatch 'OBS DuoCast %s \(Beta\) loaded", "0\.14\.29"') {
+	throw 'Packaging stopped: source version marker must be OBS DuoCast 0.14.29 Beta.'
 }
-$version = '0.14.25'
+$version = '0.14.29'
 $releaseLabel = 'Beta'
 $packageName = "OBS-DuoCast-$version-$releaseLabel-Windows-x64"
 $staging = Join-Path $buildRoot "package-$version"
@@ -50,9 +50,11 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'Uninstall-OBS-DuoCast.bat') -Des
 $installInstructions = @"
 OBS DuoCast $version for Windows x64 (Beta)
 
-Build basis: the 0.14.13 Stable MJPEG sender/receiver behavior, with the sender's
-OBS output-resolution option, Kbps audio stat cards, and an adjustable receiver
-A/V sync buffer. The sender remains MJPEG-only; legacy H.264 is receive-only.
+Build basis: 0.14.25 Beta. MJPEG (TurboJPEG) remains the default sender mode.
+Optional OBS texture-passed NVENC H.264 and HEVC/H.265 sender modes are also
+available. All modes keep the same composed OBS feed, AAC mixes, TCP transport,
+and receiver sources. NVENC uses the selected CBR target per video feed and
+OBS's GPU texture encoder when available.
 
 Requires OBS Studio 32.2.2 x64, matching the runtime used to build this plugin.
 
@@ -76,8 +78,8 @@ Requires OBS Studio 32.2.2 x64, matching the runtime used to build this plugin.
    Source. It includes the same live mix audio. Install Aitum Vertical on both
    PCs if you need to send portrait video and configure a vertical canvas on the
    sender. The receiver uses its Aitum Vertical canvas scenes for the portrait
-   fallback selector. Vertical sending adds a second MJPEG feed and uses extra
-   CPU and network resources; leave it off when the portrait feed is not needed.
+   fallback selector. Vertical sending adds a second encoded feed; NVENC mode
+   uses another NVENC session, so leave it off when not needed.
 6. Allow inbound TCP port 17777 through Windows Firewall on the receiving PC.
 7. In OBS Advanced Audio Properties on the receiver, route Video Source audio
    to the stream track and VOD Track Mix Source audio to the Twitch VOD track.
@@ -93,6 +95,10 @@ The Receiver tab has an A/V sync buffer adjustable from 0 to 3000 ms, with
 video feeds using their shared sender timestamps before decoding. This adds the
 selected delay to receiver output; changes take effect when the sender reconnects.
 The queue is bounded to 256 MiB.
+
+For H.264 and HEVC feeds, the receiver tries D3D11 hardware decoding first and
+falls back to software decoding if the local FFmpeg runtime or GPU does not
+support it. Decoded frames are copied back to system memory for OBS source output.
 
 Automatic low-FPS recovery is enabled by default. If decoded video remains below
 60% of its configured FPS for five seconds, the receiver asks the sender to
@@ -110,27 +116,30 @@ save its destination and track selections; subsequent OBS launches start it
 automatically when Enable DuoCast Sender is on. Enable DuoCast Sender and Enable
 DuoCast Receiver are separate switches and both default to off.
 
-The sender uses TurboJPEG MJPEG for video. Max total bitrate defaults to
-100 Mbps and caps the combined TCP output for video and audio. Set it to 0
-(Auto) to disable the cap. The selected JPEG quality is fixed for every frame,
-matching Teleport's fixed-quality behavior. A numeric cap paces TCP output
-without changing JPEG quality. If the network falls behind, stale queued video
-frames are dropped; a cap that is too low for the selected quality and frame
-rate can reduce delivered FPS. Max video FPS defaults to Canvas FPS
-(no cap); frames above the selected cap are skipped before JPEG compression.
-The video resolution can use either OBS canvas dimensions or OBS output dimensions.
+MJPEG (TurboJPEG) is the default video encoder, with fixed per-frame JPEG
+quality. Optional NVENC H.264 and HEVC/H.265 modes use OBS's texture-passed
+encoder with low-latency CBR settings and no B-frames. The NVENC bitrate setting
+(default 80 Mbps) is the target for each video feed. With portrait enabled,
+there are two video encoders using that target. The separate total network cap
+(default 100 Mbps) paces all video feeds and both audio tracks; set it to 0 to
+disable network pacing. Keep the shared cap above the combined NVENC targets
+plus audio overhead. The Sender UI shows the combined target and warns if the
+shared cap will throttle frames. NVENC requires compatible NVIDIA hardware and
+the matching OBS NVENC encoder. HEVC requires a receiver with HEVC decoding
+support; the receiver tries D3D11 decoding and falls back to software. Max video
+FPS defaults to the canvas FPS (no cap). Video resolution can use either OBS
+canvas dimensions or OBS output dimensions.
 
 The Docks menu includes DuoCast Sender Controls, a compact dock with
 Start Sending and Stop Sending buttons. The buttons reflect sender state and
 use the saved Sender settings.
 
-This build sends TurboJPEG MJPEG video and AAC audio. The receiver also retains
-legacy H.264 decoding compatibility; the sender does not emit H.264. FFmpeg
-libraries supplied by OBS decode AAC and H.264 on the receiver. DuoCast writes settings to the OBS
+This build can send TurboJPEG MJPEG, H.264, or HEVC video and AAC audio. FFmpeg
+libraries supplied by OBS decode AAC, H.264, and HEVC on the receiver. DuoCast writes settings to the OBS
 plugin configuration folder. That per-PC settings file is created on first save
 and should not be copied between the sender and receiver installations.
 Install this version on both PCs for matching protocol behavior. The 0.14.13
-Stable receiver supports MJPEG and legacy H.264 decoding.
+Stable receiver supports MJPEG and legacy H.264 decoding, but not HEVC.
 
 The archive includes both the new per-plugin layout and the legacy obs-plugins
 and data layout, with TurboJPEG's runtime DLL beside the module in each layout.

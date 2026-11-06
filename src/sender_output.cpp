@@ -86,6 +86,8 @@ struct SenderState {
 	std::string destination;
 	int port = 17777;
 	int video_quality = 85;
+	int video_encoder_mode = 0; // 0 = TurboJPEG MJPEG, 1 = NVENC H.264, 2 = NVENC HEVC
+	int nvenc_bitrate_mbps = 80;
 	int max_bitrate_mbps = 100;
 	int max_fps = 0;
 	std::mutex mutex;
@@ -333,14 +335,18 @@ void store_float(std::vector<std::uint8_t> &b, float value)
 
 std::vector<std::uint8_t> make_video_config(std::uint32_t width, std::uint32_t height,
 						   std::uint32_t fps_num, std::uint32_t fps_den,
-						   video_colorspace colorspace, video_range_type range)
+						   video_colorspace colorspace, video_range_type range,
+						   std::uint8_t codec_type = 4,
+						   const std::uint8_t *extra_data = nullptr, std::size_t extra_size = 0)
 {
 	std::vector<std::uint8_t> p;
-	if (!width || !height || !fps_num || !fps_den) return {};
+	if (!width || !height || !fps_num || !fps_den || extra_size > 65535 || (extra_size && !extra_data)) return {};
 	store32(p, width); store32(p, height);
 	store32(p, fps_num); store32(p, fps_den);
-	p.push_back(4); // TurboJPEG MJPEG with color parameters
-	store16(p, 0);
+	p.push_back(codec_type);
+	store16(p, static_cast<std::uint16_t>(extra_size));
+	if (extra_size) p.insert(p.end(), extra_data, extra_data + extra_size);
+	if (codec_type != 4) return p;
 	p.push_back(static_cast<std::uint8_t>(range));
 	float matrix[16]{}, range_min[3]{}, range_max[3]{};
 	video_format_get_parameters(colorspace, range, matrix, range_min, range_max);
@@ -545,19 +551,38 @@ void vertical_output_packet(void *opaque, encoder_packet *packet)
 	const bool queued = enqueue_media(s, StreamKind::VerticalVideo, dts_ns, dts_ns, packet->keyframe,
 					  packet->data, packet->size);
 	if (queued && !s->vertical_packet_queued_logged.exchange(true))
-		blog(LOG_INFO, "DuoCast: queued first Aitum Vertical TurboJPEG frame (%zu bytes)", packet->size);
+		blog(LOG_INFO, "DuoCast: queued first Aitum Vertical video frame (%zu bytes)", packet->size);
+}
+
+std::uint32_t fps_divisor_for_cap(std::uint32_t fps_num, std::uint32_t fps_den, int max_fps)
+{
+	if (!fps_num || !fps_den || max_fps <= 0 ||
+	    static_cast<std::uint64_t>(max_fps) * fps_den >= fps_num)
+		return 1;
+	const std::uint64_t denominator = static_cast<std::uint64_t>(max_fps) * fps_den;
+	return static_cast<std::uint32_t>((fps_num + denominator - 1) / denominator);
 }
 
 obs_encoder_t *create_video_encoder(SenderState *s, bool vertical)
 {
 	const std::uint32_t width = vertical ? s->vertical_width : s->video_width;
 	const std::uint32_t height = vertical ? s->vertical_height : s->video_height;
-	const std::uint32_t fps_num = vertical ? s->vertical_fps_num : s->fps_num;
-	const std::uint32_t fps_den = vertical ? s->vertical_fps_den : s->fps_den;
+	std::uint32_t fps_num = vertical ? s->vertical_fps_num : s->fps_num;
+	std::uint32_t fps_den = vertical ? s->vertical_fps_den : s->fps_den;
 	video_t *video = vertical ? s->vertical_canvas_video : obs_get_video();
 	if (!video || !width || !height) return nullptr;
-	const char *encoder_id = "duocast_turbojpeg";
-	obs_data_t *settings = obs_data_create();
+	const bool use_nvenc = s->video_encoder_mode > 0;
+	const std::uint32_t frame_rate_divisor = use_nvenc
+		? fps_divisor_for_cap(fps_num, fps_den, s->max_fps) : 1;
+	if (use_nvenc && frame_rate_divisor > 1) {
+		fps_den *= frame_rate_divisor;
+	} else if (!use_nvenc && s->max_fps > 0 && static_cast<std::uint64_t>(s->max_fps) * fps_den < fps_num) {
+		fps_num = static_cast<std::uint32_t>(s->max_fps);
+		fps_den = 1;
+	}
+	const char *encoder_id = !use_nvenc ? "duocast_turbojpeg" :
+		(s->video_encoder_mode == 2 ? "obs_nvenc_hevc_tex" : "obs_nvenc_h264_tex");
+	obs_data_t *settings = use_nvenc ? obs_encoder_defaults(encoder_id) : obs_data_create();
 	if (!settings) return nullptr;
 	obs_data_set_int(settings, "width", width);
 	obs_data_set_int(settings, "height", height);
@@ -568,12 +593,38 @@ obs_encoder_t *create_video_encoder(SenderState *s, bool vertical)
 	obs_data_set_int(settings, "quality", s->video_quality);
 	obs_data_set_bool(settings, "vertical", vertical);
 	obs_data_set_int(settings, "sender_pointer", static_cast<long long>(reinterpret_cast<std::uintptr_t>(s)));
+	if (use_nvenc) {
+		const int bitrate_kbps = std::clamp(s->nvenc_bitrate_mbps, 1, 1000) * 1000;
+		// OBS NVENC expects this exact spelling for its CBR rate-control setup.
+		obs_data_set_string(settings, "rate_control", "CBR");
+		obs_data_set_int(settings, "bitrate", bitrate_kbps);
+		obs_data_set_int(settings, "max_bitrate", bitrate_kbps);
+		obs_data_set_int(settings, "keyint_sec", 2);
+		obs_data_set_int(settings, "bf", 0);
+		obs_data_set_string(settings, "preset", "p1");
+		obs_data_set_string(settings, "tune", "ull");
+		obs_data_set_string(settings, "multipass", "disabled");
+		obs_data_set_bool(settings, "lookahead", false);
+		obs_data_set_bool(settings, "adaptive_quantization", false);
+		obs_data_set_bool(settings, "repeat_headers", true);
+	}
 	auto *encoder = obs_video_encoder_create(encoder_id, vertical ? "DuoCast Vertical Video" : "DuoCast Video",
 						 settings, nullptr);
 	obs_data_release(settings);
-	if (!encoder) return nullptr;
+	if (!encoder) {
+		blog(LOG_ERROR, "DuoCast: could not create %s encoder; check OBS NVENC codec support on this GPU",
+		     !use_nvenc ? "TurboJPEG MJPEG" : (s->video_encoder_mode == 2 ? "OBS NVENC HEVC" : "OBS NVENC H.264"));
+		return nullptr;
+	}
 	obs_encoder_set_video(encoder, video);
 	obs_encoder_set_scaled_size(encoder, width, height);
+	if (use_nvenc) {
+		// Preserve NVENC's texture path when output dimensions differ and apply
+		// the FPS cap inside libobs instead of doing frame-rate work in DuoCast.
+		obs_encoder_set_gpu_scale_type(encoder, OBS_SCALE_BICUBIC);
+		if (frame_rate_divisor > 1 && !obs_encoder_set_frame_rate_divisor(encoder, frame_rate_divisor))
+			blog(LOG_WARNING, "DuoCast: could not apply NVENC frame-rate divisor %u", frame_rate_divisor);
+	}
 	return encoder;
 }
 
@@ -661,10 +712,25 @@ void writer_thread(SenderState *s)
 			auto make_config_for_encoder = [s](obs_encoder_t *encoder, std::uint32_t width, std::uint32_t height,
 							 std::uint32_t fps_num, std::uint32_t fps_den,
 							 video_colorspace colorspace) {
-				(void)encoder;
 				if (s->max_fps > 0 && static_cast<std::uint64_t>(s->max_fps) * fps_den < fps_num) {
-					fps_num = static_cast<std::uint32_t>(s->max_fps);
-					fps_den = 1;
+					if (s->video_encoder_mode > 0) {
+						fps_den *= fps_divisor_for_cap(fps_num, fps_den, s->max_fps);
+					} else {
+						fps_num = static_cast<std::uint32_t>(s->max_fps);
+						fps_den = 1;
+					}
+				}
+				if (s->video_encoder_mode > 0) {
+					std::uint8_t *extra_data = nullptr;
+					std::size_t extra_size = 0;
+					if (!encoder || !obs_encoder_get_extra_data(encoder, &extra_data, &extra_size) || !extra_data || !extra_size) {
+						blog(LOG_ERROR, "DuoCast: NVENC did not provide %s codec headers; cannot configure receiver",
+						     s->video_encoder_mode == 2 ? "HEVC" : "H.264");
+						return std::vector<std::uint8_t>{};
+					}
+					const std::uint8_t codec_type = s->video_encoder_mode == 2 ? 5 : 1;
+					return make_video_config(width, height, fps_num, fps_den, colorspace, VIDEO_RANGE_FULL,
+								 codec_type, extra_data, extra_size);
 				}
 				return make_video_config(width, height, fps_num, fps_den, colorspace, VIDEO_RANGE_FULL);
 			};
@@ -719,7 +785,7 @@ void writer_thread(SenderState *s)
 								g_verticalVideoPackets.fetch_add(1);
 								g_verticalVideoBytes.fetch_add(payload_bytes);
 								if (!s->vertical_packet_sent_logged.exchange(true))
-									blog(LOG_INFO, "DuoCast: sent first Aitum Vertical MJPEG frame (%zu bytes)", payload_bytes);
+									blog(LOG_INFO, "DuoCast: sent first Aitum Vertical video frame (%zu bytes)", payload_bytes);
 							} else {
 							g_videoPackets.fetch_add(1);
 							g_videoBytes.fetch_add(payload_bytes);
@@ -788,6 +854,8 @@ void sender_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "live_mix", 1);
 	obs_data_set_default_int(settings, "vod_mix", 2);
 	obs_data_set_default_int(settings, "video_quality", 85);
+	obs_data_set_default_int(settings, "video_encoder_mode", 0);
+	obs_data_set_default_int(settings, "nvenc_bitrate_mbps", 80);
 	obs_data_set_default_int(settings, "max_bitrate_mbps", 100);
 	obs_data_set_default_int(settings, "max_fps", 0);
 	obs_data_set_default_bool(settings, "send_vertical", false);
@@ -800,6 +868,8 @@ void *sender_create(obs_data_t *settings, obs_output_t *output)
 	s->output = output;
 	s->send_vertical = obs_data_get_bool(settings, "send_vertical");
 	s->output_resolution = obs_data_get_int(settings, "resolution_mode") != 0;
+	s->video_encoder_mode = std::clamp(static_cast<int>(obs_data_get_int(settings, "video_encoder_mode")), 0, 2);
+	s->nvenc_bitrate_mbps = std::clamp(static_cast<int>(obs_data_get_int(settings, "nvenc_bitrate_mbps")), 1, 1000);
 	const int quality = std::clamp(static_cast<int>(obs_data_get_int(settings, "video_quality")), 1, 100);
 	struct obs_video_info info{};
 	if (!obs_get_video_info(&info) ||
@@ -814,9 +884,11 @@ void *sender_create(obs_data_t *settings, obs_output_t *output)
 	s->video_quality = quality;
 	s->max_bitrate_mbps = std::clamp(static_cast<int>(obs_data_get_int(settings, "max_bitrate_mbps")), 0, 1000);
 	s->max_fps = std::clamp(static_cast<int>(obs_data_get_int(settings, "max_fps")), 0, 120);
-	blog(LOG_INFO, "DuoCast: video settings are %s, %ux%u at %u/%u fps, TurboJPEG MJPEG quality %d%% (fixed), bitrate cap %d Mbps",
+	blog(LOG_INFO, "DuoCast: video settings are %s, %ux%u at %u/%u fps, %s, bitrate cap %d Mbps",
 	     s->output_resolution ? "OBS output resolution" : "OBS canvas resolution", s->video_width,
-	     s->video_height, s->fps_num, s->fps_den, s->video_quality, s->max_bitrate_mbps);
+	     s->video_height, s->fps_num, s->fps_den,
+	     s->video_encoder_mode == 2 ? "OBS texture-passed NVENC HEVC" :
+	     (s->video_encoder_mode == 1 ? "OBS texture-passed NVENC H.264" : "TurboJPEG MJPEG quality fixed"), s->max_bitrate_mbps);
 	if (s->send_vertical && !initialize_vertical_canvas(s)) {
 		if (s->vertical_canvas) obs_canvas_release(s->vertical_canvas);
 		delete s;
@@ -965,7 +1037,7 @@ bool sender_start(void *opaque)
 			return false;
 		}
 		s->vertical_capture_started = true;
-		blog(LOG_INFO, "DuoCast: OBS-managed Aitum Vertical TurboJPEG capture started");
+		blog(LOG_INFO, "DuoCast: OBS-managed Aitum Vertical video capture started");
 	}
 	return true;
 }
@@ -1058,7 +1130,7 @@ void register_sender_output()
 	static obs_output_info vertical_output{};
 	vertical_output.id = "duocast_vertical_transport";
 	vertical_output.flags = OBS_OUTPUT_VIDEO | OBS_OUTPUT_ENCODED;
-	vertical_output.encoded_video_codecs = "mjpeg";
+	vertical_output.encoded_video_codecs = "h264;hevc;mjpeg";
 	vertical_output.get_name = [](void *) { return "DuoCast Vertical Transport"; };
 	vertical_output.create = vertical_output_create;
 	vertical_output.destroy = vertical_output_destroy;
@@ -1071,7 +1143,7 @@ void register_sender_output()
 	info.id = "obs_duocast_sender";
 	info.flags = OBS_OUTPUT_AUDIO | OBS_OUTPUT_VIDEO | OBS_OUTPUT_ENCODED | OBS_OUTPUT_MULTI_TRACK;
 	info.encoded_audio_codecs = "aac";
-	info.encoded_video_codecs = "mjpeg";
+	info.encoded_video_codecs = "h264;hevc;mjpeg";
 	info.get_name = sender_name;
 	info.create = sender_create;
 	info.destroy = sender_destroy;
