@@ -3,17 +3,17 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $buildRoot = Join-Path $projectRoot 'build'
 $builtDll = Join-Path $buildRoot 'OBS-DuoCast-TurboJPEG.dll'
-$isolatedBuiltDll = Join-Path $buildRoot 'hw-0.14.37-source-build\OBS-DuoCast-TurboJPEG.dll'
+$isolatedBuiltDll = Join-Path $buildRoot 'hw-0.14.38-source-build\OBS-DuoCast-TurboJPEG.dll'
 if (Test-Path -LiteralPath $isolatedBuiltDll) { $builtDll = $isolatedBuiltDll }
 $turboJpegDll = Join-Path $projectRoot '.deps\libjpeg-turbo-3.2.0\sdk\bin\turbojpeg.dll'
 $turboJpegLicense = Join-Path $projectRoot '.deps\libjpeg-turbo-3.2.0\sdk\doc\LICENSE.md'
 $turboJpegIjgLicense = Join-Path $projectRoot '.deps\libjpeg-turbo-3.2.0\sdk\doc\README.ijg'
 $localeSource = Join-Path $projectRoot 'data\locale\en-US.ini'
 $versionSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'src\plugin.cpp')
-if ($versionSource -notmatch 'OBS DuoCast %s \(Beta\) loaded", "0\.14\.37"') {
-	throw 'Packaging stopped: source version marker must be OBS DuoCast 0.14.37 Beta.'
+if ($versionSource -notmatch 'OBS DuoCast %s \(Beta\) loaded", "0\.14\.38"') {
+	throw 'Packaging stopped: source version marker must be OBS DuoCast 0.14.38 Beta.'
 }
-$version = '0.14.37'
+$version = '0.14.38'
 $releaseLabel = 'Beta'
 $packageName = "OBS-DuoCast-$version-$releaseLabel-Windows-x64"
 $staging = Join-Path $buildRoot "package-$version"
@@ -52,7 +52,7 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'Uninstall-OBS-DuoCast.bat') -Des
 $installInstructions = @"
 OBS DuoCast $version for Windows x64 (Beta)
 
-Build basis: 0.14.37 Beta. MJPEG (TurboJPEG) remains the default sender mode.
+Build basis: 0.14.38 Beta. MJPEG (TurboJPEG) remains the default sender mode.
 Optional OBS texture-passed NVIDIA NVENC, Intel QuickSync, and AMD AMF H.264
 and HEVC/H.265 sender modes are listed when OBS registers texture support on
 the sender PC. All modes keep the same composed OBS feed, AAC mixes, TCP

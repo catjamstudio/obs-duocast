@@ -341,8 +341,6 @@ ControlDraft draft_from_settings(obs_data_t *settings)
 	draft.vod_track = std::clamp(static_cast<int>(obs_data_get_int(settings, "vod_track")), 1, 6);
 	draft.video_quality = std::clamp(static_cast<int>(obs_data_get_int(settings, "video_quality")), 1, 100);
 	draft.video_encoder_mode = std::clamp(static_cast<int>(obs_data_get_int(settings, "video_encoder_mode")), 0, 6);
-	if (draft.video_encoder_mode > 0 && !duocast::video_encoder_available(draft.video_encoder_mode))
-		draft.video_encoder_mode = 0;
 	draft.nvenc_bitrate_mbps = std::clamp(static_cast<int>(obs_data_get_int(settings, "nvenc_bitrate_mbps")), 1, 1000);
 	draft.hevc_10bit = obs_data_get_bool(settings, "hevc_10bit");
 	draft.max_bitrate_mbps = std::clamp(static_cast<int>(obs_data_get_int(settings, "max_bitrate_mbps")), 0, 1000);
@@ -448,7 +446,9 @@ bool save_settings_clicked(obs_properties_t *, obs_property_t *, void *opaque)
 	obs_source_t *target = state && state->view == ToolView::Receiver ? g_receiverControlSource : g_senderControlSource;
 	g_settingsSaveOk = apply_draft_to_source(target);
  g_settingsSavedAt = os_gettime_ns() / 1000000ULL;
- blog(g_settingsSaveOk ? LOG_INFO : LOG_ERROR, "DuoCast: settings %s", g_settingsSaveOk ? "saved" : "could not be saved");
+	blog(g_settingsSaveOk ? LOG_INFO : LOG_ERROR, "DuoCast: settings %s (saved video encoder: %s)",
+	     g_settingsSaveOk ? "saved" : "could not be saved",
+	     duocast::video_encoder_display_name(control_draft_snapshot().video_encoder_mode));
  if (g_senderControlSource) obs_source_update_properties(g_senderControlSource);
  if (g_receiverControlSource) obs_source_update_properties(g_receiverControlSource);
  return true;
@@ -1481,7 +1481,9 @@ void save_ui_settings()
 		g_saveFeedbackLabel->setStyleSheet(ok ? "color:#62d996;font-weight:600;" : "color:#ff7777;font-weight:600;");
 		g_saveFeedbackLabel->setVisible(true);
 	}
-	blog(ok ? LOG_INFO : LOG_ERROR, "DuoCast: settings %s", ok ? "saved" : "could not be saved");
+	blog(ok ? LOG_INFO : LOG_ERROR, "DuoCast: settings %s (saved video encoder: %s)",
+	     ok ? "saved" : "could not be saved",
+	     duocast::video_encoder_display_name(control_draft_snapshot().video_encoder_mode));
 }
 
 void show_duocast_tool(void *)
@@ -1503,7 +1505,7 @@ void show_duocast_tool(void *)
 	g_enableSenderCheck->setChecked(draft.enable_sender);
 	g_enableReceiverCheck = new QCheckBox("Enable DuoCast Receiver");
 	g_enableReceiverCheck->setChecked(draft.enable_receiver);
-	auto *version = new QLabel("OBS DuoCast 0.14.37 Beta"); version->setStyleSheet("color:#aeb4bd;");
+	auto *version = new QLabel("OBS DuoCast 0.14.38 Beta"); version->setStyleSheet("color:#aeb4bd;");
 	header->addWidget(title); header->addSpacing(18); header->addWidget(g_enableSenderCheck); header->addWidget(g_enableReceiverCheck); header->addStretch(); header->addWidget(version); root->addLayout(header);
 	auto *tabs = new QTabWidget; root->addWidget(tabs, 1);
 	auto *senderPage = new QWidget; auto *senderLayout = new QVBoxLayout(senderPage);
@@ -1527,6 +1529,11 @@ void show_duocast_tool(void *)
 	for (const auto &encoder : duocast::kHardwareVideoEncoders) {
 		if (duocast::video_encoder_available(encoder))
 			g_videoEncoderCombo->addItem(encoder.label, static_cast<int>(encoder.mode));
+	}
+	if (draft.video_encoder_mode > 0 && g_videoEncoderCombo->findData(draft.video_encoder_mode) < 0) {
+		const auto *savedEncoder = duocast::video_encoder_mode_info(draft.video_encoder_mode);
+		const QString savedLabel = savedEncoder ? QString::fromUtf8(savedEncoder->label) : "Saved hardware encoder";
+		g_videoEncoderCombo->addItem(savedLabel + " (not currently available)", draft.video_encoder_mode);
 	}
 	int encoderIndex = g_videoEncoderCombo->findData(draft.video_encoder_mode);
 	if (encoderIndex < 0) encoderIndex = 0;
@@ -1747,7 +1754,7 @@ void show_duocast_tool(void *)
 obs_properties_t *control_source_properties(void *opaque)
 {
 	auto *props = obs_properties_create();
-	obs_properties_add_text(props, "duocast_version", "OBS DuoCast 0.14.37 (Beta)", OBS_TEXT_INFO);
+	obs_properties_add_text(props, "duocast_version", "OBS DuoCast 0.14.38 (Beta)", OBS_TEXT_INFO);
 	const auto *state = static_cast<ControlSourceState *>(opaque);
 	if (state && state->view == ToolView::Receiver) {
 		auto *receiver = obs_properties_create();
@@ -1928,7 +1935,7 @@ void control_source_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "landscape_live_scene", cfg ? config_get_string(cfg, kConfigSection, kLandscapeLiveSceneKey) : "");
 	obs_data_set_default_string(settings, "vertical_live_scene", cfg ? config_get_string(cfg, kConfigSection, kVerticalLiveSceneKey) : "");
 	obs_data_set_default_bool(settings, "force_auto_switch_live", cfg && config_get_bool(cfg, kConfigSection, kForceAutoSwitchLiveKey));
-	obs_data_set_default_string(settings, "duocast_version", "OBS DuoCast 0.14.37 (Beta)");
+	obs_data_set_default_string(settings, "duocast_version", "OBS DuoCast 0.14.38 (Beta)");
 }
 
 std::string current_scene_name()
@@ -2114,9 +2121,12 @@ bool start_sender_from_saved_preferences()
 	const int live = static_cast<int>(config_get_int(cfg, kConfigSection, kLiveTrackKey));
 	const int vod = static_cast<int>(config_get_int(cfg, kConfigSection, kVodTrackKey));
 	const int quality = static_cast<int>(config_get_int(cfg, kConfigSection, kVideoQualityKey));
-	int video_encoder_mode = std::clamp(static_cast<int>(config_get_int(cfg, kConfigSection, kVideoEncoderModeKey)), 0, 6);
-	if (video_encoder_mode > 0 && !duocast::video_encoder_available(video_encoder_mode))
-		video_encoder_mode = 0;
+	const int video_encoder_mode = std::clamp(static_cast<int>(config_get_int(cfg, kConfigSection, kVideoEncoderModeKey)), 0, 6);
+	if (video_encoder_mode > 0 && !duocast::video_encoder_available(video_encoder_mode)) {
+		blog(LOG_WARNING, "DuoCast: saved sender encoder '%s' is not currently registered; preserving the setting and skipping autostart",
+		     duocast::video_encoder_display_name(video_encoder_mode));
+		return false;
+	}
 	const int nvenc_bitrate_mbps = std::clamp(static_cast<int>(config_get_int(cfg, kConfigSection, kNvencBitrateKey)), 1, 1000);
 	const bool hevc_10bit = config_get_bool(cfg, kConfigSection, kHevc10BitKey);
 	const int max_bitrate = static_cast<int>(config_get_int(cfg, kConfigSection, kMaxBitrateKey));
@@ -2232,12 +2242,13 @@ bool obs_module_load(void)
 				if (!config_has_user_value(cfg, kConfigSection, key) && config_has_user_value(profile, kConfigSection, key))
 					config_set_string(cfg, kConfigSection, key, config_get_string(profile, kConfigSection, key));
 			const char *int_keys[] = {kPortKey, kLiveTrackKey, kVodTrackKey, kVideoQualityKey,
-						  kMaxBitrateKey, kMaxFpsKey, kVideoResolutionKey, kReceiverSyncBufferKey};
+						  kVideoEncoderModeKey, kNvencBitrateKey, kMaxBitrateKey, kMaxFpsKey,
+						  kVideoResolutionKey, kReceiverSyncBufferKey, kReceiverDecoderModeKey};
 			for (const char *key : int_keys)
 				if (!config_has_user_value(cfg, kConfigSection, key) && config_has_user_value(profile, kConfigSection, key))
 					config_set_int(cfg, kConfigSection, key, config_get_int(profile, kConfigSection, key));
-			const char *bool_keys[] = {kAutostartKey, kSenderConfiguredKey, kSendVerticalKey, kEnableDuoCastKey, kAutoRecoverLowFpsKey,
-					    kForceAutoSwitchLiveKey};
+			const char *bool_keys[] = {kAutostartKey, kSenderConfiguredKey, kSendVerticalKey, kEnableDuoCastKey,
+					    kAutoRecoverLowFpsKey, kForceAutoSwitchLiveKey, kHevc10BitKey};
 			for (const char *key : bool_keys)
 				if (!config_has_user_value(cfg, kConfigSection, key) && config_has_user_value(profile, kConfigSection, key))
 					config_set_bool(cfg, kConfigSection, key, config_get_bool(profile, kConfigSection, key));
@@ -2252,6 +2263,8 @@ bool obs_module_load(void)
 		config_set_default_int(cfg, kConfigSection, kPortKey, 17777);
 		config_set_default_int(cfg, kConfigSection, kLiveTrackKey, 1);
 		config_set_default_int(cfg, kConfigSection, kVodTrackKey, 2);
+		config_set_default_int(cfg, kConfigSection, kVideoEncoderModeKey, 0);
+		config_set_default_int(cfg, kConfigSection, kNvencBitrateKey, 80);
 		// Convert the previous 2-31 encoder quality value to the matching slider
 		// percentage once. New values are TurboJPEG quality, directly 1-100.
 		if (config_get_int(cfg, kConfigSection, "VideoTransportVersion") < 2) {
@@ -2288,6 +2301,9 @@ bool obs_module_load(void)
 		config_set_default_bool(cfg, kConfigSection, kEnableDuoCastKey, false);
 		config_set_default_bool(cfg, kConfigSection, kEnableSenderKey, false);
 		config_set_default_bool(cfg, kConfigSection, kEnableReceiverKey, false);
+		const int loaded_encoder = std::clamp(static_cast<int>(config_get_int(cfg, kConfigSection, kVideoEncoderModeKey)), 0, 6);
+		blog(LOG_INFO, "DuoCast: loaded saved video encoder preference: %s (mode %d)",
+		     duocast::video_encoder_display_name(loaded_encoder), loaded_encoder);
 		config_save_safe(cfg, "tmp", "bak");
 	}
 	g_cpuUsageInfo = os_cpu_usage_info_start();
@@ -2314,7 +2330,7 @@ bool obs_module_load(void)
 	obs_frontend_add_tools_menu_item("DuoCast", show_duocast_tool, nullptr);
 	create_sender_dock();
 	create_receiver_stats_dock();
-	blog(LOG_INFO, "OBS DuoCast %s (Beta) loaded", "0.14.37");
+	blog(LOG_INFO, "OBS DuoCast %s (Beta) loaded", "0.14.38");
 	return true;
 }
 

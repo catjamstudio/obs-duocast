@@ -1,9 +1,9 @@
 # OBS DuoCast
 
-**Current development build:** 0.14.37 Beta for Windows x64 / OBS Studio 32.2.2.
+**Current development build:** 0.14.38 Beta for Windows x64 / OBS Studio 32.2.2.
 **Fallback build:** 0.14.13 Stable remains available if you need to roll back.
 
-The 0.14.37 build continues from the 0.14.36 Beta checkpoint. MJPEG remains the
+The 0.14.38 build continues from the 0.14.37 Beta checkpoint. MJPEG remains the
 default, with optional texture-passed NVIDIA NVENC, Intel QuickSync, and AMD AMF
 H.264 and HEVC/H.265 sender modes. Hardware bitrate is configurable per feed.
 The receiver offers Auto or an available FFmpeg hardware decoder for H.264 and
@@ -17,7 +17,7 @@ independent canvas.
 
 ## Install
 
-Use `dist/OBS-DuoCast-0.14.37-Beta-Windows-x64.zip` for the sender and receiver with MJPEG, NVENC/QuickSync/AMF H.264 or HEVC video, receiver decoder selection (including Intel and AMD GPU D3D11VA), a live active decoder indicator, output-resolution selection, Kbps audio stat cards, receiver sync buffering, and automatic low-FPS recovery.
+Use `dist/OBS-DuoCast-0.14.38-Beta-Windows-x64.zip` for the sender and receiver with MJPEG, NVENC/QuickSync/AMF H.264 or HEVC video, receiver decoder selection (including Intel and AMD GPU D3D11VA), saved encoder preference preservation, a live active decoder indicator, output-resolution selection, Kbps audio stat cards, receiver sync buffering, and automatic low-FPS recovery.
 Use `dist/OBS-DuoCast-0.14.13-Stable-Windows-x64.zip` to roll back. Close OBS before installing.
 The ZIP contains both OBS's new per-plugin layout and the legacy plugin folders.
 For OBS 33.0+ Portable, extract it into the portable root; for a standard OBS
@@ -50,7 +50,7 @@ canvas.
 The optional max FPS
 cap applies to both feeds; sender stats show the actual outgoing FPS. Optional
 portrait sending requires Aitum Vertical installed and configured on the sender
-PC. Install 0.14.37 on both PCs for matching sender and receiver behavior. The
+PC. Install 0.14.38 on both PCs for matching sender and receiver behavior. The
 receiver supports MJPEG, H.264, and HEVC.
 
 The sender also provides a **DuoCast Receiver Stats** dock. It receives the
@@ -104,7 +104,7 @@ fallback scenes.
 
 ## Transport and build
 
-The 0.14.37 Beta sends TurboJPEG MJPEG or OBS texture-passed NVENC, QuickSync,
+The 0.14.38 Beta sends TurboJPEG MJPEG or OBS texture-passed NVENC, QuickSync,
 or AMF H.264/HEVC and can use either OBS canvas or scaled output dimensions.
 Hardware modes use the OBS GPU texture path, with B-frames disabled so video
 decode and audio stay on the shared sender system-time timeline. The receiver
