@@ -3,15 +3,17 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $buildRoot = Join-Path $projectRoot 'build'
 $builtDll = Join-Path $buildRoot 'OBS-DuoCast-TurboJPEG.dll'
+$isolatedBuiltDll = Join-Path $buildRoot 'hw-0.14.37-source-build\OBS-DuoCast-TurboJPEG.dll'
+if (Test-Path -LiteralPath $isolatedBuiltDll) { $builtDll = $isolatedBuiltDll }
 $turboJpegDll = Join-Path $projectRoot '.deps\libjpeg-turbo-3.2.0\sdk\bin\turbojpeg.dll'
 $turboJpegLicense = Join-Path $projectRoot '.deps\libjpeg-turbo-3.2.0\sdk\doc\LICENSE.md'
 $turboJpegIjgLicense = Join-Path $projectRoot '.deps\libjpeg-turbo-3.2.0\sdk\doc\README.ijg'
 $localeSource = Join-Path $projectRoot 'data\locale\en-US.ini'
 $versionSource = Get-Content -Raw -LiteralPath (Join-Path $projectRoot 'src\plugin.cpp')
-if ($versionSource -notmatch 'OBS DuoCast %s \(Beta\) loaded", "0\.14\.29"') {
-	throw 'Packaging stopped: source version marker must be OBS DuoCast 0.14.29 Beta.'
+if ($versionSource -notmatch 'OBS DuoCast %s \(Beta\) loaded", "0\.14\.37"') {
+	throw 'Packaging stopped: source version marker must be OBS DuoCast 0.14.37 Beta.'
 }
-$version = '0.14.29'
+$version = '0.14.37'
 $releaseLabel = 'Beta'
 $packageName = "OBS-DuoCast-$version-$releaseLabel-Windows-x64"
 $staging = Join-Path $buildRoot "package-$version"
@@ -50,11 +52,13 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'Uninstall-OBS-DuoCast.bat') -Des
 $installInstructions = @"
 OBS DuoCast $version for Windows x64 (Beta)
 
-Build basis: 0.14.25 Beta. MJPEG (TurboJPEG) remains the default sender mode.
-Optional OBS texture-passed NVENC H.264 and HEVC/H.265 sender modes are also
-available. All modes keep the same composed OBS feed, AAC mixes, TCP transport,
-and receiver sources. NVENC uses the selected CBR target per video feed and
-OBS's GPU texture encoder when available.
+Build basis: 0.14.37 Beta. MJPEG (TurboJPEG) remains the default sender mode.
+Optional OBS texture-passed NVIDIA NVENC, Intel QuickSync, and AMD AMF H.264
+and HEVC/H.265 sender modes are listed when OBS registers texture support on
+the sender PC. All modes keep the same composed OBS feed, AAC mixes, TCP
+transport, and receiver sources. Hardware modes use the selected CBR target
+per video feed. HEVC hardware modes also have an optional Main10/P010 10-bit
+path through DuoCast when OBS and both GPUs support it.
 
 Requires OBS Studio 32.2.2 x64, matching the runtime used to build this plugin.
 
@@ -78,8 +82,8 @@ Requires OBS Studio 32.2.2 x64, matching the runtime used to build this plugin.
    Source. It includes the same live mix audio. Install Aitum Vertical on both
    PCs if you need to send portrait video and configure a vertical canvas on the
    sender. The receiver uses its Aitum Vertical canvas scenes for the portrait
-   fallback selector. Vertical sending adds a second encoded feed; NVENC mode
-   uses another NVENC session, so leave it off when not needed.
+   fallback selector. Vertical sending adds a second encoded feed and a second
+   hardware encoder session, so leave it off when not needed.
 6. Allow inbound TCP port 17777 through Windows Firewall on the receiving PC.
 7. In OBS Advanced Audio Properties on the receiver, route Video Source audio
    to the stream track and VOD Track Mix Source audio to the Twitch VOD track.
@@ -117,15 +121,23 @@ automatically when Enable DuoCast Sender is on. Enable DuoCast Sender and Enable
 DuoCast Receiver are separate switches and both default to off.
 
 MJPEG (TurboJPEG) is the default video encoder, with fixed per-frame JPEG
-quality. Optional NVENC H.264 and HEVC/H.265 modes use OBS's texture-passed
-encoder with low-latency CBR settings and no B-frames. The NVENC bitrate setting
-(default 80 Mbps) is the target for each video feed. With portrait enabled,
+quality. Optional NVENC, QuickSync, and AMF H.264 and HEVC/H.265 modes use OBS's
+texture-passed encoders with low-latency CBR settings and no B-frames. The
+hardware bitrate setting (default 80 Mbps) is the target for each video feed. With portrait enabled,
 there are two video encoders using that target. The separate total network cap
 (default 100 Mbps) paces all video feeds and both audio tracks; set it to 0 to
-disable network pacing. Keep the shared cap above the combined NVENC targets
+disable network pacing. Keep the shared cap above the combined hardware targets
 plus audio overhead. The Sender UI shows the combined target and warns if the
-shared cap will throttle frames. NVENC requires compatible NVIDIA hardware and
-the matching OBS NVENC encoder. HEVC requires a receiver with HEVC decoding
+shared cap will throttle frames. Hardware choices appear only when OBS has
+registered a texture-capable encoder for the sender's GPU and driver. The
+Sender settings include an optional HEVC 10-bit (Main10/P010) mode. It requests
+OBS's P010 texture format, marks the feed as Main10, and preserves P010 frames
+on the receiver. If OBS cannot initialize P010 for the selected encoder, the
+sender reports a start failure. The receiver needs a compatible 10-bit HEVC
+decoder; its OBS/Twitch output may still be 8-bit. Stop and restart sending
+after changing this option.
+receiver Video decoder selector offers Auto and available FFmpeg hardware
+decoders; failed hardware initialization falls back to software. HEVC requires a receiver with HEVC decoding
 support; the receiver tries D3D11 decoding and falls back to software. Max video
 FPS defaults to the canvas FPS (no cap). Video resolution can use either OBS
 canvas dimensions or OBS output dimensions.

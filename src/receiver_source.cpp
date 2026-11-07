@@ -10,6 +10,7 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/frame.h>
 #include <libavutil/error.h>
+#include <libavutil/dict.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>
@@ -27,6 +28,7 @@ extern "C" {
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cctype>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -63,10 +65,18 @@ std::unordered_map<int, std::weak_ptr<class ReceiverSession>> g_sessions;
 std::mutex g_sessionsMutex;
 std::atomic<bool> g_receiverEnabled{false};
 std::atomic<int> g_receiverSyncBufferMs{1000};
+std::atomic<int> g_receiverDecoderMode{0}; // 0 = automatic, otherwise AVHWDeviceType
+constexpr int kReceiverDecoderIntelD3D11VA = 1000;
+constexpr int kReceiverDecoderAmdD3D11VA = 1001;
 std::atomic<bool> g_autoRecoverLowFps{true};
 std::atomic<bool> g_requestSenderRecovery{false};
 std::mutex g_remoteStatsMutex;
 obs_duocast::protocol::ReceiverStats g_remoteStats{};
+enum class DecodePathState : int { Waiting, HardwarePending, HardwareActive, SoftwareActive, MjpegCpu, HardwareTransferFailed };
+std::atomic<int> g_landscapeDecodeState{static_cast<int>(DecodePathState::Waiting)};
+std::atomic<int> g_verticalDecodeState{static_cast<int>(DecodePathState::Waiting)};
+std::atomic<int> g_landscapeDecodeBackend{0};
+std::atomic<int> g_verticalDecodeBackend{0};
 
 bool write_exact(SOCKET socket, const std::uint8_t *data, std::size_t size)
 {
@@ -176,6 +186,7 @@ private:
 		AVFrame *frame = nullptr;
 		AVFrame *transfer_frame = nullptr;
 		AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
+		int hardware_decoder_mode = 0;
 		SwrContext *resampler = nullptr;
 		tjhandle jpeg = nullptr;
 		std::array<std::vector<std::uint8_t>, 3> jpeg_planes;
@@ -185,7 +196,9 @@ private:
 		bool has_jpeg_color_params = false;
 		video_range_type jpeg_range = VIDEO_RANGE_FULL;
 		AVCodecID codec_id = AV_CODEC_ID_NONE;
+		bool expected_10bit = false;
 		bool first_frame_logged = false;
+		bool decode_path_logged = false;
 	};
 	struct QueuedMedia {
 		StreamKind kind = StreamKind::Heartbeat;
@@ -518,8 +531,11 @@ private:
 		d.width = d.height = 0;
 		d.expected_fps_milli = 0;
 		d.first_frame_logged = false;
+		d.decode_path_logged = false;
 		d.hw_pix_fmt = AV_PIX_FMT_NONE;
+		d.hardware_decoder_mode = 0;
 		d.codec_id = AV_CODEC_ID_NONE;
+		d.expected_10bit = false;
 		d.has_jpeg_color_params = false;
 	}
 
@@ -529,7 +545,8 @@ private:
 		clear_decoder(d);
 		const AVCodec *codec = avcodec_find_decoder(id);
 		if (!codec || extra_size > 65535) return false;
-		auto initialize = [&](bool use_d3d11va) {
+		auto initialize = [&](AVHWDeviceType device_type, const char *vendor_id = nullptr) {
+			clear_decoder(d);
 			d.ctx = avcodec_alloc_context3(codec);
 			if (!d.ctx) return false;
 			d.ctx->time_base = AVRational{1, 1000000000};
@@ -549,21 +566,28 @@ private:
 				std::memcpy(d.ctx->extradata, extra, extra_size);
 				d.ctx->extradata_size = static_cast<int>(extra_size);
 			}
-			if (use_d3d11va) {
+			if (device_type != AV_HWDEVICE_TYPE_NONE) {
 				const AVCodecHWConfig *hw_config = nullptr;
 				for (int i = 0; (hw_config = avcodec_get_hw_config(codec, i)); ++i) {
-					if (hw_config->device_type == AV_HWDEVICE_TYPE_D3D11VA &&
+					if (hw_config->device_type == device_type &&
 					    (hw_config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
 						break;
 					hw_config = nullptr;
 				}
 				AVBufferRef *device = nullptr;
-				if (!hw_config || av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) < 0)
+				AVDictionary *device_options = nullptr;
+				if (vendor_id)
+					av_dict_set(&device_options, "vendor_id", vendor_id, 0);
+				const int device_result = hw_config
+					? av_hwdevice_ctx_create(&device, device_type, nullptr, device_options, 0) : -1;
+				av_dict_free(&device_options);
+				if (device_result < 0)
 					return false;
 				d.ctx->hw_device_ctx = av_buffer_ref(device);
 				av_buffer_unref(&device);
 				if (!d.ctx->hw_device_ctx) return false;
 				d.hw_pix_fmt = hw_config->pix_fmt;
+				d.hardware_decoder_mode = static_cast<int>(device_type);
 				d.ctx->opaque = &d;
 				d.ctx->get_format = [](AVCodecContext *ctx, const AVPixelFormat *formats) {
 					auto *decoder = static_cast<Decoder *>(ctx->opaque);
@@ -576,20 +600,59 @@ private:
 			}
 			if (avcodec_open2(d.ctx, codec, nullptr) < 0) return false;
 			d.frame = av_frame_alloc();
-			if (use_d3d11va) d.transfer_frame = av_frame_alloc();
-			return d.frame && (!use_d3d11va || d.transfer_frame);
+			if (device_type != AV_HWDEVICE_TYPE_NONE) d.transfer_frame = av_frame_alloc();
+			return d.frame && (device_type == AV_HWDEVICE_TYPE_NONE || d.transfer_frame);
 		};
-
-		if ((id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC) && initialize(true)) {
-			blog(LOG_INFO, "DuoCast: using D3D11 hardware decoding for %s", video_codec_label(id));
-			return true;
-		}
 		if (id == AV_CODEC_ID_H264 || id == AV_CODEC_ID_HEVC) {
-			blog(LOG_WARNING, "DuoCast: D3D11 %s decoding unavailable; falling back to software decoding",
-			     video_codec_label(id));
-			clear_decoder(d);
+			std::vector<AVHWDeviceType> candidates;
+			auto supports_device = [&](AVHWDeviceType type) {
+				for (int i = 0; const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i); ++i)
+					if (config->device_type == type && (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX))
+						return true;
+				return false;
+			};
+			const int requested = g_receiverDecoderMode.load();
+			if (requested == kReceiverDecoderIntelD3D11VA || requested == kReceiverDecoderAmdD3D11VA) {
+				const bool intel = requested == kReceiverDecoderIntelD3D11VA;
+				const char *vendor_id = intel ? "0x8086" : "0x1002";
+				const char *decoder_name = intel ? "Intel Quick Sync (D3D11VA)" : "AMD GPU (D3D11VA)";
+				if (supports_device(AV_HWDEVICE_TYPE_D3D11VA) && initialize(AV_HWDEVICE_TYPE_D3D11VA, vendor_id)) {
+					d.hardware_decoder_mode = requested;
+					blog(LOG_INFO, "DuoCast: using %s hardware decoding for %s", decoder_name, video_codec_label(id));
+					return true;
+				}
+			} else if (requested > 0) {
+				const auto type = static_cast<AVHWDeviceType>(requested);
+				if (supports_device(type)) candidates.push_back(type);
+			} else {
+				constexpr AVHWDeviceType preferred[] = {AV_HWDEVICE_TYPE_D3D11VA, AV_HWDEVICE_TYPE_DXVA2,
+					AV_HWDEVICE_TYPE_QSV, AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VAAPI,
+					AV_HWDEVICE_TYPE_VIDEOTOOLBOX};
+				for (const auto type : preferred)
+					if (supports_device(type)) candidates.push_back(type);
+				for (int i = 0; const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i); ++i) {
+					const auto type = config->device_type;
+					if (!(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) ||
+					    std::find(candidates.begin(), candidates.end(), type) != candidates.end())
+						continue;
+					candidates.push_back(type);
+				}
+			}
+			for (const auto type : candidates) {
+				if (initialize(type)) {
+					const char *name = av_hwdevice_get_type_name(type);
+					blog(LOG_INFO, "DuoCast: using %s hardware decoding for %s", name ? name : "selected", video_codec_label(id));
+					return true;
+				}
+			}
+			if (requested > 0)
+				blog(LOG_WARNING, "DuoCast: selected hardware decoder is unavailable for %s; falling back to software",
+				     video_codec_label(id));
+			else
+				blog(LOG_WARNING, "DuoCast: no usable hardware decoder for %s; falling back to software",
+				     video_codec_label(id));
 		}
-		if (initialize(false)) return true;
+		if (initialize(AV_HWDEVICE_TYPE_NONE)) return true;
 		clear_decoder(d);
 		return false;
 	}
@@ -601,13 +664,13 @@ private:
 		const auto extra_size = read16(p.data() + 17);
 		const auto codec_type = p[16];
 		const AVCodecID codec_id = codec_type == 1 ? AV_CODEC_ID_H264 :
-			codec_type == 5 ? AV_CODEC_ID_HEVC :
+			(codec_type == 5 || codec_type == 6) ? AV_CODEC_ID_HEVC :
 			(codec_type == 2 || codec_type == 4) ? AV_CODEC_ID_MJPEG : AV_CODEC_ID_NONE;
 		const std::size_t color_bytes = codec_type == 4 ? 89 : 0;
 		if (codec_id == AV_CODEC_ID_NONE || !w || !h || w > 8192 || h > 8192 ||
 		    p.size() != 19 + extra_size + color_bytes) return;
-		blog(LOG_INFO, "DuoCast: received %s video config (%s, %ux%u)", vertical ? "vertical" : "landscape",
-		     codec_id == AV_CODEC_ID_MJPEG ? "TurboJPEG MJPEG" : video_codec_label(codec_id), w, h);
+		blog(LOG_INFO, "DuoCast: received %s video config (%s%s, %ux%u)", vertical ? "vertical" : "landscape",
+		     codec_id == AV_CODEC_ID_MJPEG ? "TurboJPEG MJPEG" : video_codec_label(codec_id), codec_type == 6 ? " Main10" : "", w, h);
 		bool opened = false;
 		if (codec_id == AV_CODEC_ID_MJPEG && !extra_size && w <= INT_MAX && h <= INT_MAX && !(w & 1) && !(h & 1)) {
 			clear_decoder(decoder);
@@ -623,6 +686,26 @@ private:
 					       p.data() + 19, extra_size);
 		}
 		if (opened) {
+			const auto state = codec_id == AV_CODEC_ID_MJPEG ? DecodePathState::MjpegCpu
+				: decoder.hw_pix_fmt != AV_PIX_FMT_NONE ? DecodePathState::HardwarePending : DecodePathState::SoftwareActive;
+			const auto backend = decoder.hardware_decoder_mode;
+			if (vertical) {
+				g_verticalDecodeState.store(static_cast<int>(state));
+				g_verticalDecodeBackend.store(backend);
+			} else {
+				g_landscapeDecodeState.store(static_cast<int>(state));
+				g_landscapeDecodeBackend.store(backend);
+			}
+			if (codec_id == AV_CODEC_ID_MJPEG)
+				blog(LOG_INFO, "DuoCast: %s video uses CPU TurboJPEG decoding; hardware decoder selection does not apply to MJPEG",
+				     vertical ? "vertical" : "landscape");
+			else if (decoder.hw_pix_fmt == AV_PIX_FMT_NONE)
+				blog(LOG_WARNING, "DuoCast: %s %s video is configured for software decoding",
+				     vertical ? "vertical" : "landscape", video_codec_label(codec_id));
+			else
+				blog(LOG_INFO, "DuoCast: %s %s hardware decoder initialized; waiting to confirm a hardware-decoded frame",
+				     vertical ? "vertical" : "landscape", video_codec_label(codec_id));
+			decoder.expected_10bit = codec_type == 6;
 			const auto fps_num = read32(p.data() + 8);
 			const auto fps_den = read32(p.data() + 12);
 			decoder.expected_fps_milli = fps_den
@@ -692,12 +775,42 @@ private:
 					if (transfer_result < 0) {
 						char error[AV_ERROR_MAX_STRING_SIZE]{};
 						av_strerror(transfer_result, error, sizeof(error));
-						blog(LOG_WARNING, "DuoCast: D3D11 decoded frame transfer failed: %s", error);
+						blog(LOG_WARNING, "DuoCast: hardware decoded frame transfer failed: %s", error);
+						if (!d.decode_path_logged) {
+							const bool vertical = kind == StreamKind::VerticalVideo;
+						(vertical ? g_verticalDecodeState : g_landscapeDecodeState).store(
+							static_cast<int>(DecodePathState::HardwareTransferFailed));
+						blog(LOG_WARNING, "DuoCast: %s hardware decoding produced a GPU frame, but transfer to OBS memory failed",
+						     vertical ? "vertical" : "landscape");
+							d.decode_path_logged = true;
+						}
 						av_frame_unref(d.frame);
 						continue;
 					}
+					if (!d.decode_path_logged) {
+						const bool vertical = kind == StreamKind::VerticalVideo;
+						(vertical ? g_verticalDecodeState : g_landscapeDecodeState).store(
+							static_cast<int>(DecodePathState::HardwareActive));
+						const int backend = d.hardware_decoder_mode;
+						const char *backend_name = backend == kReceiverDecoderIntelD3D11VA ? "Intel Quick Sync (D3D11VA)"
+							: backend == kReceiverDecoderAmdD3D11VA ? "AMD GPU (D3D11VA)"
+							: av_hwdevice_get_type_name(static_cast<AVHWDeviceType>(backend));
+						blog(LOG_INFO, "DuoCast: %s hardware decoding CONFIRMED for %s (%s); first GPU frame transferred successfully",
+						     vertical ? "vertical" : "landscape", video_codec_label(d.codec_id),
+						     backend_name ? backend_name : "selected hardware decoder");
+						d.decode_path_logged = true;
+					}
 					av_frame_copy_props(d.transfer_frame, d.frame);
 					decoded = d.transfer_frame;
+				} else if (is_video && d.hw_pix_fmt != AV_PIX_FMT_NONE && !d.decode_path_logged) {
+					const char *pixel_format = av_get_pix_fmt_name(static_cast<AVPixelFormat>(d.frame->format));
+					const bool vertical = kind == StreamKind::VerticalVideo;
+					(vertical ? g_verticalDecodeState : g_landscapeDecodeState).store(
+						static_cast<int>(DecodePathState::SoftwareActive));
+					blog(LOG_WARNING, "DuoCast: %s requested hardware decoding for %s, but FFmpeg returned software frames (%s); SOFTWARE FALLBACK is active",
+					     vertical ? "vertical" : "landscape", video_codec_label(d.codec_id),
+					     pixel_format ? pixel_format : "unknown pixel format");
+					d.decode_path_logged = true;
 				}
 				const auto timestamp = decoded->pts != AV_NOPTS_VALUE && decoded->pts >= 0
 					? static_cast<std::uint64_t>(decoded->pts) : pts;
@@ -707,6 +820,9 @@ private:
 						blog(LOG_INFO, "DuoCast: decoded first %s frame (%dx%d, format %s)",
 						     video_codec_label(d.codec_id), decoded->width, decoded->height,
 						     pixel_format ? pixel_format : "unknown");
+						if (d.expected_10bit && decoded->format != AV_PIX_FMT_P010LE &&
+						    decoded->format != AV_PIX_FMT_YUV420P10LE)
+							blog(LOG_WARNING, "DuoCast: sender marked this HEVC feed Main10, but the receiver decoder returned a non-10-bit frame");
 						d.first_frame_logged = true;
 					} else if (!is_video && decoded->nb_samples > 0 && decoded->data[0]) {
 						blog(LOG_INFO, "DuoCast: decoded first %s AAC frame (%d samples)",
@@ -781,6 +897,41 @@ private:
 		else if (decoded->colorspace == AVCOL_SPC_BT470BG || decoded->colorspace == AVCOL_SPC_SMPTE170M)
 			colorspace = VIDEO_CS_601;
 		else if (decoded->colorspace == AVCOL_SPC_BT709) colorspace = VIDEO_CS_709;
+		if (decoded->format == AV_PIX_FMT_P010LE && !(decoded->width & 1) && !(decoded->height & 1) &&
+		    decoded->data[0] && decoded->data[1] && decoded->linesize[0] >= static_cast<int>(decoded->width * 2) &&
+		    decoded->linesize[1] >= static_cast<int>(decoded->width * 2)) {
+			deliver_video_p010(decoded->data[0], decoded->data[1], decoded->linesize[0], decoded->linesize[1],
+					   decoded->width, decoded->height, timestamp, kind, range, colorspace);
+			return;
+		}
+		if (decoded->format == AV_PIX_FMT_YUV420P10LE && !(decoded->width & 1) && !(decoded->height & 1) &&
+		    decoded->data[0] && decoded->data[1] && decoded->data[2]) {
+			const std::size_t y_bytes = static_cast<std::size_t>(decoded->width) * decoded->height * 2;
+			const std::size_t uv_bytes = static_cast<std::size_t>(decoded->width) * decoded->height;
+			std::vector<std::uint8_t> y(y_bytes), uv(uv_bytes);
+			for (std::uint32_t row = 0; row < decoded->height; ++row) {
+				const auto *src = reinterpret_cast<const std::uint16_t *>(decoded->data[0] +
+					static_cast<std::ptrdiff_t>(row) * decoded->linesize[0]);
+				auto *dst = reinterpret_cast<std::uint16_t *>(y.data() + static_cast<std::size_t>(row) * decoded->width * 2);
+				for (std::uint32_t col = 0; col < decoded->width; ++col)
+					dst[col] = static_cast<std::uint16_t>((src[col] & 0x03ffU) << 6);
+			}
+			for (std::uint32_t row = 0; row < decoded->height / 2; ++row) {
+				const auto *u = reinterpret_cast<const std::uint16_t *>(decoded->data[1] +
+					static_cast<std::ptrdiff_t>(row) * decoded->linesize[1]);
+				const auto *v = reinterpret_cast<const std::uint16_t *>(decoded->data[2] +
+					static_cast<std::ptrdiff_t>(row) * decoded->linesize[2]);
+				auto *dst = reinterpret_cast<std::uint16_t *>(uv.data() + static_cast<std::size_t>(row) * decoded->width * 2);
+				for (std::uint32_t col = 0; col < decoded->width / 2; ++col) {
+					dst[col * 2] = static_cast<std::uint16_t>((u[col] & 0x03ffU) << 6);
+					dst[col * 2 + 1] = static_cast<std::uint16_t>((v[col] & 0x03ffU) << 6);
+				}
+			}
+			deliver_video_p010(y.data(), uv.data(), static_cast<int>(decoded->width * 2),
+					   static_cast<int>(decoded->width * 2), decoded->width, decoded->height,
+					   timestamp, kind, range, colorspace);
+			return;
+		}
 		if (decoded->format == AV_PIX_FMT_NV12 && !(decoded->width & 1) && !(decoded->height & 1)) {
 			std::vector<std::uint8_t> u(static_cast<std::size_t>(decoded->width) * decoded->height / 4);
 			std::vector<std::uint8_t> v(u.size());
@@ -832,6 +983,31 @@ private:
 			video_format_get_parameters_for_format(colorspace, range, VIDEO_FORMAT_I420,
 						       frame.color_matrix, frame.color_range_min, frame.color_range_max);
 		}
+		std::lock_guard<std::mutex> lock(sinksMutex_);
+		const auto sink = kind == StreamKind::VerticalVideo ? SinkKind::Vertical : SinkKind::Video;
+		for (auto *source : sinks_[index(sink)]) obs_source_output_video2(source, &frame);
+		const auto previewSink = kind == StreamKind::VerticalVideo ? SinkKind::PreviewVertical : SinkKind::PreviewVideo;
+		for (auto *source : sinks_[index(previewSink)]) obs_source_output_video2(source, &frame);
+	}
+
+	void deliver_video_p010(std::uint8_t *y, std::uint8_t *uv, int y_stride, int uv_stride,
+			 std::uint32_t width, std::uint32_t height, std::uint64_t timestamp,
+			 StreamKind kind, video_range_type range, video_colorspace colorspace)
+	{
+		if (kind == StreamKind::VerticalVideo) delivered_vertical_frames_.fetch_add(1);
+		else delivered_landscape_frames_.fetch_add(1);
+		struct obs_source_frame2 frame{};
+		frame.data[0] = y;
+		frame.data[1] = uv;
+		frame.linesize[0] = static_cast<std::uint32_t>(y_stride);
+		frame.linesize[1] = static_cast<std::uint32_t>(uv_stride);
+		frame.width = width;
+		frame.height = height;
+		frame.timestamp = timestamp;
+		frame.format = VIDEO_FORMAT_P010;
+		frame.range = range;
+		video_format_get_parameters_for_format(colorspace, range, VIDEO_FORMAT_P010,
+						       frame.color_matrix, frame.color_range_min, frame.color_range_max);
 		std::lock_guard<std::mutex> lock(sinksMutex_);
 		const auto sink = kind == StreamKind::VerticalVideo ? SinkKind::Vertical : SinkKind::Video;
 		for (auto *source : sinks_[index(sink)]) obs_source_output_video2(source, &frame);
@@ -1026,6 +1202,103 @@ void receiver_set_enabled(bool enabled)
 void receiver_set_sync_buffer_ms(int delay_ms)
 {
 	g_receiverSyncBufferMs.store(std::clamp(delay_ms, 0, 3000));
+}
+
+std::vector<std::pair<int, std::string>> receiver_hardware_decoder_options()
+{
+	std::vector<std::pair<int, std::string>> options;
+	bool supports_d3d11va = false;
+	for (const auto codec_id : {AV_CODEC_ID_H264, AV_CODEC_ID_HEVC}) {
+		const AVCodec *codec = avcodec_find_decoder(codec_id);
+		if (!codec) continue;
+		for (int i = 0; const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i); ++i) {
+			if (!(config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) || config->device_type == AV_HWDEVICE_TYPE_NONE)
+				continue;
+			if (config->device_type == AV_HWDEVICE_TYPE_D3D11VA)
+				supports_d3d11va = true;
+			const auto value = static_cast<int>(config->device_type);
+			if (std::find_if(options.begin(), options.end(), [value](const auto &entry) { return entry.first == value; }) != options.end())
+				continue;
+			AVBufferRef *device = nullptr;
+			if (av_hwdevice_ctx_create(&device, config->device_type, nullptr, nullptr, 0) < 0)
+				continue;
+			av_buffer_unref(&device);
+			const char *raw_name = av_hwdevice_get_type_name(config->device_type);
+			std::string label = raw_name ? raw_name : "Hardware decoder";
+			std::transform(label.begin(), label.end(), label.begin(), [](unsigned char c) {
+				return static_cast<char>(std::toupper(c));
+			});
+			options.emplace_back(value, std::move(label));
+		}
+	}
+	if (supports_d3d11va) {
+		const auto add_vendor_decoder = [&](const char *vendor_id, int mode, const char *label) {
+			AVDictionary *device_options = nullptr;
+			av_dict_set(&device_options, "vendor_id", vendor_id, 0);
+			AVBufferRef *device = nullptr;
+			const int result = av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_D3D11VA, nullptr,
+							 device_options, 0);
+			av_dict_free(&device_options);
+			if (result >= 0) {
+				av_buffer_unref(&device);
+				options.emplace_back(mode, label);
+			}
+		};
+		add_vendor_decoder("0x8086", kReceiverDecoderIntelD3D11VA, "Intel Quick Sync (D3D11VA)");
+		add_vendor_decoder("0x1002", kReceiverDecoderAmdD3D11VA, "AMD GPU (D3D11VA)");
+	}
+	return options;
+}
+
+void receiver_set_decoder_mode(int mode)
+{
+	const int selected = std::max(0, mode);
+	const int previous = g_receiverDecoderMode.exchange(selected);
+	if (previous != selected) {
+		const char *decoder_name = selected == 0 ? "Auto" : selected == kReceiverDecoderIntelD3D11VA
+			? "Intel Quick Sync (D3D11VA)" : selected == kReceiverDecoderAmdD3D11VA
+			? "AMD GPU (D3D11VA)" : av_hwdevice_get_type_name(static_cast<AVHWDeviceType>(selected));
+		blog(LOG_INFO, "DuoCast: receiver decoder preference changed to %s; requesting a sender reconnect",
+		     decoder_name ? decoder_name : "unknown hardware decoder");
+		g_requestSenderRecovery.store(true);
+	}
+}
+
+ReceiverDecodeStatus receiver_decode_status()
+{
+	const auto describe = [](int raw_state, int backend) {
+		const auto state = static_cast<DecodePathState>(raw_state);
+		switch (state) {
+		case DecodePathState::HardwarePending: {
+			const char *name = backend == kReceiverDecoderIntelD3D11VA ? "Intel D3D11VA"
+				: backend == kReceiverDecoderAmdD3D11VA ? "AMD D3D11VA"
+				: backend > 0 ? av_hwdevice_get_type_name(static_cast<AVHWDeviceType>(backend)) : nullptr;
+			return std::string("HW selected · waiting for frame") + (name ? std::string(" · ") + name : "");
+		}
+		case DecodePathState::HardwareActive: {
+			const char *name = backend == kReceiverDecoderIntelD3D11VA ? "Intel D3D11VA"
+				: backend == kReceiverDecoderAmdD3D11VA ? "AMD D3D11VA"
+				: backend > 0 ? av_hwdevice_get_type_name(static_cast<AVHWDeviceType>(backend)) : nullptr;
+			return std::string("HARDWARE ACTIVE") + (name ? std::string(" · ") + name : "");
+		}
+		case DecodePathState::SoftwareActive: return std::string("SOFTWARE FALLBACK");
+		case DecodePathState::MjpegCpu: return std::string("CPU · TurboJPEG MJPEG");
+		case DecodePathState::HardwareTransferFailed: return std::string("HARDWARE FRAME TRANSFER FAILED");
+		default: return std::string("Waiting for video");
+		}
+	};
+	const int landscape_state = g_landscapeDecodeState.load();
+	const int vertical_state = g_verticalDecodeState.load();
+	ReceiverDecodeStatus status;
+	status.text = "Landscape: " + describe(landscape_state, g_landscapeDecodeBackend.load()) +
+		"   |   Vertical: " + describe(vertical_state, g_verticalDecodeBackend.load());
+	status.software_fallback = landscape_state == static_cast<int>(DecodePathState::SoftwareActive) ||
+		vertical_state == static_cast<int>(DecodePathState::SoftwareActive) ||
+		landscape_state == static_cast<int>(DecodePathState::HardwareTransferFailed) ||
+		vertical_state == static_cast<int>(DecodePathState::HardwareTransferFailed);
+	status.waiting = landscape_state == static_cast<int>(DecodePathState::Waiting) &&
+		vertical_state == static_cast<int>(DecodePathState::Waiting);
+	return status;
 }
 
 void receiver_set_auto_recovery_enabled(bool enabled)
